@@ -26,6 +26,7 @@ from .common import (
     AGENT_DATA, SEARCH_INDEX, WEEKDAYS, agent_registry, fmt_taipei, lock_down,
     load_json, taipei, unknown_agent_entry, valid_agent_id, write,
 )
+from .coverage import has_tool_blocks, load_store_transcript
 
 USER_LABEL = os.environ.get("GROK_BACKUP_USER_LABEL", os.environ.get("NUWA_BACKUP_USER_LABEL", "User"))
 GROUP_ASSISTANT_LABEL = "Assistant (group; speaker unspecified by index)"
@@ -33,8 +34,10 @@ ATTACH_RE = re.compile(r"attachments/([0-9a-f]{64})")
 
 
 # --------------------------------------------------------------------------- source
-def open_index_snapshot(path: pathlib.Path = SEARCH_INDEX) -> tuple[sqlite3.Connection, int]:
+def open_index_snapshot(path: pathlib.Path | None = None) -> tuple[sqlite3.Connection, int]:
     """Consistent in-memory copy of the live index (includes WAL content)."""
+    if path is None:
+        path = SEARCH_INDEX
     if not path.exists():
         raise SystemExit(f"ERROR: search index not found: {path}")
     src = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
@@ -153,12 +156,15 @@ def render_month(info, month, rows, media_by_entry) -> str:
     return "\n".join(out) + "\n"
 
 
-def render_frozen_transcript(jsonl: pathlib.Path, info, result_limit: int = 2000) -> str:
+def render_frozen_transcript(jsonl: pathlib.Path, info, result_limit: int = 2000,
+                             source_note: str | None = None) -> str:
+    source = source_note or "agent-transcripts/<id>/<id>.jsonl (local history; check timestamps and coverage)"
     out = [
-        f"# {info['name']} — Frozen local transcript (including tool calls)",
+        f"# {info['name']} — Tool-call transcript",
         "",
-        "- Source: agent-transcripts/<id>/<id>.jsonl (local history; check timestamps and coverage)",
-        "- This rendering has no timestamps; see the original data in `agent-transcript.jsonl`",
+        f"- Source: {source}",
+        "- Raw rows: `raw/transcript.jsonl`",
+        "- Timestamps are included only when the source row has them",
         f"- Tool results longer than {result_limit} characters are truncated; raw JSONL is unchanged",
         "",
     ]
@@ -185,6 +191,84 @@ def render_frozen_transcript(jsonl: pathlib.Path, info, result_limit: int = 2000
                         res = res[:result_limit] + f"\n... (truncated; original length {len(res)} characters)"
                     out += [f"#### #{n} Tool result: `{b.get('name')}`", "", "```", res, "```", ""]
     return "\n".join(out) + "\n"
+
+
+def _transcript_sources(info: dict) -> tuple[pathlib.Path, pathlib.Path]:
+    agent_id = info["id"]
+    agent_dir = info.get("dir")
+    if agent_dir is not None:
+        root = pathlib.Path(agent_dir).parent.parent
+        return (root / "agent-transcripts" / agent_id / f"{agent_id}.jsonl",
+                pathlib.Path(agent_dir) / "store.db")
+    return (AGENT_DATA / "agent-transcripts" / agent_id / f"{agent_id}.jsonl",
+            AGENT_DATA / "agents" / agent_id / "store.db")
+
+
+def _parse_transcript_jsonl(path: pathlib.Path) -> list[dict]:
+    rows = []
+    with path.open(encoding="utf-8", errors="replace") as handle:
+        for raw in handle:
+            if not raw.strip():
+                continue
+            try:
+                obj = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(obj, dict):
+                rows.append(obj)
+    return rows
+
+
+def _write_transcript_jsonl(path: pathlib.Path, rows: list[dict]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as handle:
+        for row in rows:
+            handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
+def first_user_message(agent_id: str, index_path: pathlib.Path | None = None) -> str | None:
+    """Verbatim body of the earliest user message. None when the index has none."""
+    path = index_path or SEARCH_INDEX
+    if not path.is_file():
+        return None
+    try:
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        row = conn.execute(
+            "select body from messages where agent_id=? and role=? "
+            "and body is not null and trim(body) != '' "
+            "order by timestamp_ms, seq, id limit 1",
+            (agent_id, "user"),
+        ).fetchone()
+        conn.close()
+    except sqlite3.Error:
+        return None
+    if not row or not isinstance(row[0], str) or not row[0].strip():
+        return None
+    return row[0]
+
+
+def export_tool_transcript(info: dict, conv_dir: pathlib.Path) -> tuple[str, str]:
+    """Probe both transcript stores. Return (coverage cell, source note)."""
+    jsonl_path, db_path = _transcript_sources(info)
+    file_rows = _parse_transcript_jsonl(jsonl_path) if jsonl_path.is_file() else []
+    db_rows = load_store_transcript(db_path)
+    raw = conv_dir / "raw" / "transcript.jsonl"
+    if file_rows:
+        raw.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(jsonl_path, raw)
+        source = "agent-transcripts/<id>/<id>.jsonl"
+        if db_rows:
+            source += "; store.db transcript_entries also present (jsonl used)"
+        write(conv_dir / "transcript.md", render_frozen_transcript(raw, info, source_note=source))
+        return ("ok" if has_tool_blocks(file_rows) else "partial", source)
+    if db_rows:
+        _write_transcript_jsonl(raw, db_rows)
+        source = "agents/<id>/store.db transcript_entries"
+        if jsonl_path.is_file():
+            source += "; agent-transcripts jsonl had no readable rows"
+        write(conv_dir / "transcript.md", render_frozen_transcript(raw, info, source_note=source))
+        return ("ok" if has_tool_blocks(db_rows) else "partial", source)
+    return ("unavailable", "tool calls: unavailable")
 
 
 # --------------------------------------------------------------------------- export
@@ -245,14 +329,8 @@ def export_agent_conversation(db, info, conv_dir: pathlib.Path, attach_link: Cal
     lines += ["", "> Attachment files are stored under hash-based names; links point to files inside this backup."]
     write(conv_dir / "attachment-index.md", "\n".join(lines))
 
-    # supplement: frozen local transcript with tool calls
-    tj = AGENT_DATA / "agent-transcripts" / info["id"] / f"{info['id']}.jsonl"
-    has_frozen = tj.exists()
-    if has_frozen:
-        sup = conv_dir / "frozen-transcript-with-tool-calls"
-        sup.mkdir(exist_ok=True)
-        shutil.copy2(tj, sup / "agent-transcript.jsonl")
-        write(sup / "transcript.md", render_frozen_transcript(tj, info))
+    # Tool calls: agent-transcripts JSONL, else store.db transcript_entries.
+    tool_cell, tool_source = export_tool_transcript(info, conv_dir)
 
     users = sum(1 for r in rows if r[2] == "user")
     stats = {
@@ -263,7 +341,10 @@ def export_agent_conversation(db, info, conv_dir: pathlib.Path, attach_link: Cal
         "last_ms": rows[-1][3] if rows else None,
         "months": {k: len(v) for k, v in months.items()},
         "media": len(media), "media_files_found": found,
-        "frozen_supplement": has_frozen, "cutoff_ms": cutoff_ms,
+        "frozen_supplement": tool_cell in ("ok", "partial"),
+        "toolcalls": tool_cell,
+        "toolcalls_source": tool_source,
+        "cutoff_ms": cutoff_ms,
     }
 
     # per-agent index
@@ -280,8 +361,12 @@ def export_agent_conversation(db, info, conv_dir: pathlib.Path, attach_link: Cal
     idx += ["", "## Other", "",
             f"- [attachment-index.md](attachment-index.md): {len(media)} attachments ({found} found on the box)",
             "- raw/messages.jsonl and raw/media.jsonl: machine-readable raw data"]
-    if has_frozen:
-        idx.append("- frozen-transcript-with-tool-calls/: frozen local transcript (including tool calls; no timestamps; check original file coverage)")
+    if tool_cell == "unavailable":
+        idx.append("- tool calls: unavailable (probed agent-transcripts/<id>/<id>.jsonl and agents/<id>/store.db transcript_entries)")
+    elif tool_cell == "partial":
+        idx.append("- tool calls: partial (raw/transcript.jsonl and transcript.md have no tool_use or tool_result blocks)")
+    else:
+        idx.append("- tool calls: raw/transcript.jsonl and transcript.md")
     idx += ["", "## Notes", "",
             f"- {USER_LABEL} labels the user side of a conversation; it may also include messages relayed from other people or assistants.",
             "- Only user-visible message text is indexed; tool calls and tool results are not included.",

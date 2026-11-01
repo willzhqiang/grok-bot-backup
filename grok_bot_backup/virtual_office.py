@@ -16,7 +16,8 @@ import shutil
 
 
 from . import conversations
-from .memory_drop import apply_tree as apply_memory_drop
+from .coverage import assemble_rows, presence_cell, write_agent_views, write_reports
+from .memory_drop import apply_tree as apply_memory_drop, drop_root
 from .common import (
     AGENT_DATA, OUT_ROOT, WORKSPACE, add_deprecated_private_args, copy_if,
     lock_down, safe_name, utc_stamp, warn_deprecated_private_args, write, valid_agent_id,
@@ -29,7 +30,18 @@ STAMP = utc_stamp()
 DEST = OUT_ROOT / f"virtual-office-{STAMP}"
 
 
-def export_agent(agent_dir: pathlib.Path, dest_agents: pathlib.Path, id_to_name: dict) -> str | None:
+def _copy_tree(src: pathlib.Path, dst: pathlib.Path) -> int:
+    copied = 0
+    if not src.exists():
+        return 0
+    for path in src.rglob("*"):
+        if path.is_file():
+            copy_if(path, dst / path.relative_to(src))
+            copied += 1
+    return copied
+
+
+def export_agent(agent_dir: pathlib.Path, dest_agents: pathlib.Path, id_to_name: dict) -> dict | None:
     profile_path = agent_dir / "profile.json"
     if not profile_path.exists() or (agent_dir / "group.json").exists():
         return None
@@ -80,43 +92,64 @@ def export_agent(agent_dir: pathlib.Path, dest_agents: pathlib.Path, id_to_name:
             parts.append(f"## {p.relative_to(mem)}\n\n{p.read_text(encoding='utf-8', errors='replace')}\n")
         write(folder / "memory-summary.md", "\n".join(parts))
 
-    auto = agent_dir / "automations"
-    if auto.exists() and any(auto.iterdir()):
-        for p in auto.rglob("*"):
-            if p.is_file():
-                copy_if(p, folder / "routines" / p.relative_to(auto))
+    copied = {
+        "attachments-and-work": _copy_tree(agent_dir / "attachments", folder / "attachments-and-work"),
+        "references": _copy_tree(agent_dir / "reference", folder / "references"),
+        "private": _copy_tree(agent_dir / "private", folder / "private"),
+        "notes-and-profiles": _copy_tree(agent_dir / "notes", folder / "notes-and-profiles"),
+    }
+    handoff = conversations.first_user_message(agent_dir.name)
+    routines_file = drop_root() / "agents" / agent_dir.name / "routines.json"
+    views = write_agent_views(
+        folder, name, agent_dir, profile, settings,
+        handoff=handoff, routines_file=routines_file,
+    )
+    views["cells"]["private"] = presence_cell(agent_dir / "private", folder / "private")
+    views["cells"]["attachments"] = presence_cell(agent_dir / "attachments", folder / "attachments-and-work")
+    if views["cells"]["instructions"] == "unavailable":
+        print(f"WARN instructions unavailable: {name} source={views['notes'].get('instructions')}", flush=True)
+    if views["cells"]["routines"] == "unavailable":
+        print(f"WARN routines unavailable: {name}", flush=True)
 
-    for src_name, dst_name in [("attachments", "attachments-and-work"), ("reference", "references"), ("private", "private")]:
-        src = agent_dir / src_name
-        if src.exists():
-            for p in src.rglob("*"):
-                if p.is_file():
-                    copy_if(p, folder / dst_name / p.relative_to(src))
-
-    # notes: copy all files without private-content filtering
-    notes = agent_dir / "notes"
-    if notes.exists():
-        for p in notes.rglob("*"):
-            if p.is_file():
-                copy_if(p, folder / "notes-and-profiles" / p.relative_to(notes))
-
+    rows = [
+        ("`profile.md`", "Name, role, and behavior guidelines"),
+        ("`instructions.md`", "Full instructions, or a reconstructed stand-in when the system prompt is not on disk"),
+        ("`raw/instructions.json`", "Instruction source, complete flag, and coverage"),
+        ("`connectors.md`", "Connector names and auth status (no tokens)"),
+        ("`routines.md`", "Schedules, or an unavailable marker when none were found"),
+        ("`conversations/`", "Full conversations (one Markdown file per month, Taipei time)"),
+    ]
+    if any(folder.glob("avatar.*")):
+        rows.append(("`avatar.*`", "Avatar image"))
+    if (folder / "memory").exists():
+        rows.append(("`memory/`, `memory-summary.md`", "Long-term memory (local files may be outdated)"))
+    if copied["notes-and-profiles"]:
+        rows.append(("`notes-and-profiles/`", "Assistant notes, preserving their directory structure"))
+    if copied["attachments-and-work"]:
+        rows.append(("`attachments-and-work/`", "Chat attachments and outputs"))
+    if copied["references"]:
+        rows.append(("`references/`", "Role reference documents"))
+    if copied["private"]:
+        rows.append(("`private/`", "Private assistant files"))
+    if (folder / "routines").is_dir():
+        rows.append(("`routines/`", "One JSON file per schedule definition"))
+    table = "\n".join(f"| {label} | {desc} |" for label, desc in rows)
     write(folder / "README.md", f"""# {name}
 
 This is a portable virtual employee/role package that a person can read or import into another virtual office.
 
 | File / folder | Description |
 |---|---|
-| `profile.md` | Name, role, and behavior guidelines |
-| `avatar.*` | Avatar image |
-| `conversations/` | **Full conversations** (one Markdown file per month, Taipei time; see README.md) |
-| `memory/`, `memory-summary.md` | Long-term memory (local files may be outdated) |
-| `notes-and-profiles/` | All assistant notes, preserving their directory structure |
-| `attachments-and-work/` | Chat attachments and outputs (hash-based filenames; see `conversations/attachment-index.md`) |
-| `references/` | Role reference documents |
-| `routines/` | Scheduled routines (if present) |
+{table}
 """)
     id_to_name[agent_dir.name] = name
-    return name
+    return {
+        "id": agent_dir.name,
+        "name": name,
+        "assistant_dir": folder,
+        "cells": views["cells"],
+        "notes": views["notes"],
+    }
 
 
 def export_group(group_dir: pathlib.Path, dest_groups: pathlib.Path, id_to_name: dict) -> None:
@@ -199,15 +232,25 @@ def main() -> None:
     DEST.mkdir(parents=True)
 
     id_to_name: dict[str, str] = {}
+    records: list[dict] = []
     agents_root = AGENT_DATA / "agents"
     dest_agents, dest_groups, dest_shared = DEST / "01-assistants", DEST / "02-groups", DEST / "00-shared"
 
+    group_count = 0
     for d in sorted(agents_root.iterdir()):
         if d.is_dir() and valid_agent_id(d.name) and (d / "profile.json").exists() and not (d / "group.json").exists():
-            export_agent(d, dest_agents, id_to_name)
+            record = export_agent(d, dest_agents, id_to_name)
+            if record:
+                records.append(record)
     for d in sorted(agents_root.iterdir()):
         if d.is_dir() and valid_agent_id(d.name) and (d / "group.json").exists():
             export_group(d, dest_groups, id_to_name)
+            group_count += 1
+    if group_count == 0:
+        write(dest_groups / "README.md", f"""# Groups
+
+No group chats in this export (checked `{agents_root}` for `group.json`).
+""")
     workspace_report = export_shared(dest_shared)
     write(DEST / 'workspace-copy.json', json.dumps(workspace_report, ensure_ascii=False, indent=2))
     mem_status = apply_memory_drop(DEST, id_to_name)
@@ -227,6 +270,10 @@ def main() -> None:
         lambda info, d: str(d.relative_to(DEST)), DEST / "99-backup-program" / "conversation-stats.json",
         rel_root=DEST,
     )
+    for stat in conv_stats:
+        if stat.get("kind") == "agent" and stat.get("toolcalls") == "unavailable":
+            print(f"WARN tool calls unavailable: {stat['name']}", flush=True)
+    write_reports(DEST, assemble_rows(records, conv_stats, mem_status, DEST))
     # ---- copy of this program (repo at HEAD + commit hash)
     prog = snapshot_program(DEST / "99-backup-program")
 
@@ -246,9 +293,11 @@ def main() -> None:
 ## Contents
 
 - conversation-index.md — conversation overview for all assistants (counts, ranges, links)
+- coverage.md / coverage.json — per-assistant matrix (instructions, memory, routines, conversation, toolcalls, private, attachments, connectors)
+- memory-index.md / memory-pending.json — which memory drops were exported and which are still missing
 - `00-shared/` — Company knowledge, shared memory, skills and deliverables
-- 01-assistants/<name>/ — profiles, avatars, memory, monthly conversation Markdown, notes and attachments
-- `02-groups/<name>/` — group metadata and conversations
+- 01-assistants/<name>/ — instructions, profile, routines, connectors, memory, conversations, and any notes or attachments that exist on disk
+- `02-groups/<name>/` — group metadata and conversations, or a note when no group.json was found
 - `99-backup-program/` — source code, commit and conversation statistics for this backup
 - `roster.md`
 
@@ -258,8 +307,10 @@ After extraction: `grep -rn "keyword" 01-assistants/*/conversations/`
 
 ## Known limitations
 
-- Platform memory drops from {os.environ.get('MEMORY_DROP', str(WORKSPACE / 'exports' / 'memory-drop'))} are copied when available (see memory-index.md). Missing drops are labeled 'not exported'. Local memory files may be stale.
-- The platform index contains only visible chat text; tool calls and results are in the frozen local transcript supplement (check source coverage).
+- Platform memory drops from {os.environ.get('MEMORY_DROP', str(WORKSPACE / 'exports' / 'memory-drop'))} are copied when available (see memory-index.md and memory-pending.json). Missing drops are labeled 'not exported'. Local memory files may be stale.
+- A full system prompt is often hosted by the platform and absent from disk. instructions.md then uses source `reconstructed` and coverage `unavailable`.
+- Routines are probed from automations/, routines/, schedules/, cron.json, automations.json, and the platform schedule store. Inferred rows are guesses. If none are found, routines.md says unavailable.
+- Tool calls are probed from agent-transcripts/<id>/<id>.jsonl and agents/<id>/store.db transcript_entries. A miss is written as `tool calls: unavailable` in conversations/README.md.
 - For group conversations, the index does not identify which assistant spoke.
 """)
 

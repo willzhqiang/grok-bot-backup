@@ -219,6 +219,71 @@ class MemoryFreshnessTests(unittest.TestCase):
             self.assertEqual(code, 1)
             self.assertIn("malformed memory records", output)
 
+    def test_facts_plus_stale_no_memories_declaration_fails_strict(self):
+        with tempfile.TemporaryDirectory() as temp:
+            export, data = self._fixture(Path(temp), age_days=1)
+            directory = export / "01-assistants/Test Agent/memory"
+            status = directory / "memory-status.json"
+            status.write_text(json.dumps({
+                "status": "no_memories",
+                "agent_id": AGENT_ID,
+                "checked_at_utc": "2026-10-01T00:00:00Z",
+            }))
+            code, output = self._run(export, data, False)
+            self.assertEqual(code, 0)
+            self.assertIn("WARN Test Agent", output)
+            self.assertIn("declares no_memories", output)
+            code, output = self._run(export, data, True)
+            self.assertEqual(code, 1)
+            self.assertIn("FAIL Test Agent", output)
+            self.assertIn("memory-status.json declares no_memories but JSONL contains 1 facts", output)
+            self.assertIn("delete the stale declaration", output)
+            self.assertTrue(status.is_file())
+            self.assertFalse((directory / "memory-status-stale.json").exists())
+
+    def test_exporter_keeps_status_filename_when_facts_exist(self):
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+            source = base / "memory-drop"
+            agent_source = source / "agents" / AGENT_ID
+            agent_source.mkdir(parents=True)
+            (agent_source / "memory-agent.jsonl").write_text(
+                '{"date":"2026-10-22","tier":"note","scope":"agent","fact":"kept fact"}\n')
+            (agent_source / "memory-status.json").write_text(json.dumps({
+                "status": "no_memories",
+                "agent_id": AGENT_ID,
+                "checked_at_utc": "2026-10-01T00:00:00Z",
+            }))
+            with patch.object(memory_drop, "drop_root", return_value=source), \
+                 patch.object(memory_drop, "EXPECTED_AGENTS",
+                              [(AGENT_ID, "Test Agent", True)]), \
+                 patch.object(memory_drop, "AGENT_DATA", base / "no-agent-data"):
+                readable = base / "virtual-office"
+                (readable / "01-assistants/Test Agent").mkdir(parents=True)
+                memory_drop.apply_tree(readable, {AGENT_ID: "Test Agent"})
+            copied = readable / "01-assistants/Test Agent/memory"
+            self.assertTrue((copied / "memory-status.json").is_file())
+            self.assertTrue((copied / "memory-agent.jsonl").is_file())
+            self.assertIn("kept fact", (copied / "memory-agent.jsonl").read_text())
+            self.assertFalse((copied / "memory-status-stale.json").exists())
+            index = (readable / "memory-index.md").read_text(encoding="utf-8")
+            self.assertTrue(index.startswith("Memory export: 1/1, missing: none"))
+            pending = json.loads((readable / "memory-pending.json").read_text(encoding="utf-8"))
+            self.assertEqual(pending["missing"], [])
+
+    def test_renamed_memory_export_notes_does_not_satisfy_strict(self):
+        with tempfile.TemporaryDirectory() as temp:
+            export, data = self._fixture(Path(temp), age_days=1)
+            directory = export / "01-assistants/Test Agent/memory"
+            (directory / "memory-export-notes.json").write_text(json.dumps({
+                "status": "no_memories",
+                "agent_id": AGENT_ID,
+                "checked_at_utc": "2026-10-22T08:00:00Z",
+            }))
+            code, output = self._run(export, data, True)
+            self.assertEqual(code, 1)
+            self.assertIn("memory-export-notes.json is not a supported declaration", output)
+
     def test_empty_shared_memory_export_does_not_pass_strict(self):
         with tempfile.TemporaryDirectory() as temp:
             export, data = self._fixture(Path(temp), age_days=1)

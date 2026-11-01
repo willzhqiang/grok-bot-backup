@@ -145,6 +145,8 @@ If the assistant has **actually checked every accessible memory tier and found z
 
 The `agent_id` must match that assistant's UUID. `checked_at_utc` must be the genuine, timezone-aware UTC timestamp of the completed check, within `MEMORY_MAX_AGE_DAYS` of the backup (default: two days). The exporter preserves this separate file and the verifier checks the declaration. **Only use it after explicitly confirming there are no retrievable memories; never generate a declaration just to make `--strict` pass.** If facts are available, export them instead.
 
+Do not leave `memory-status.json` in place after facts have been exported. When a drop contains nonempty JSONL facts and a `no_memories` declaration together, `verify --strict` fails. Delete the stale declaration before exporting. The tool keeps the filename `memory-status.json` so the contradiction stays visible.
+
 Shared user memory may use the same mechanism under `shared-user/memory-status.json`, substituting `"scope": "user"` for `agent_id`. Shared user memory is optional when not accessible, but a *present yet empty* shared memory JSONL file is not considered a successful export without the declaration.
 
 **Group chats are not individual assistants.** A group does not require a separate RecallMemory export to pass `--strict`, and the verifier prints `SKIP MEMORY` to make that exception clear. If group memory files are actually provided, they are checked for valid facts, freshness, and empty-export declarations as well. Individual assistants participating in a group still require their own memory exports.
@@ -170,9 +172,30 @@ MEMORY_MAX_AGE_DAYS=2 bin/verify-export.sh /path/to/export --strict
 
 # Optional: require at least one conversation on a particular day:
 bin/verify-export.sh /path/to/export --date YYYY-MM-DD
+
+# Print the coverage matrix (also written as coverage.md during export):
+bin/verify-export.sh /path/to/export --coverage
+
+# Strict: missing matrix cells fail. Unavailable cells warn and do not fail.
+bin/verify-export.sh /path/to/export --coverage --strict
 ```
 
-The verifier prints each available assistant's memory-file last-modified timestamp explicitly in **UTC**, and the age relative to the backup snapshot. File modification time is only a proxy for when the memory was exported, not proof that the retrieved content is complete. It lists missing drops by assistant name. A missing, stale, malformed, or unconfirmed empty drop is a **WARN** (exit 0 if other checks pass); with `--strict` it becomes **FAIL** (nonzero exit). Groups are exempt from mandatory assistant-memory export; a genuinely empty export needs the explicit, recent `memory-status.json` confirmation described above. This check does not prove that all memories have been retrieved—it detects absent or aging export files.
+The verifier prints each available assistant's memory-file last-modified timestamp explicitly in **UTC**, and the age relative to the backup snapshot. File modification time is only a proxy for when the memory was exported, not proof that the retrieved content is complete. It lists missing drops by assistant name. A missing, stale, malformed, or unconfirmed empty drop is a **WARN** (exit 0 if other checks pass); with `--strict` it becomes **FAIL** (nonzero exit). A `no_memories` declaration next to nonempty facts is also a **FAIL** under `--strict`. Groups are exempt from mandatory assistant-memory export; a genuinely empty export needs the explicit, recent `memory-status.json` confirmation described above. This check does not prove that all memories have been retrieved—it detects absent or aging export files.
+
+### Coverage matrix
+
+Each Virtual Office export, and each raw export, writes `coverage.json` and `coverage.md`. Rows are assistants. Columns are `instructions`, `memory`, `routines`, `conversation`, `toolcalls`, `private`, `attachments`, `connectors`, `business-data-tree`, `ui-only-secrets`, and `standing-rules`. Each cell is `ok`, `partial`, `unavailable`, or `missing`.
+
+With no `config.json` roster, `memory-index.md` lists agent ids discovered under the memory drop's `agents/` directory in **Per assistant**. Only directories outside that set are **Additional drops**.
+
+| Cell | Meaning |
+| --- | --- |
+| `ok` | The export captured this for the assistant |
+| `partial` | Something was captured, with a gap (for example only inferred routines, or facts plus a stale empty-memory declaration) |
+| `unavailable` | The probes ran and the platform did not have this on disk |
+| `missing` | A required piece was absent from the export |
+
+`verify --coverage` prints the matrix. With `--strict`, a `missing` cell fails the run. An `unavailable` cell prints **WARN** and does not, by itself, fail `--strict`. A platform-hosted system prompt is `unavailable` (see instructions below), not a permanent failure.
 
 Inspect the raw export's `meta/MANIFEST.json`, `meta/workspace-copy.json`, and `platform-memory/memory-index.md` for included data, exclusions, and RecallMemory status. The readable export has `memory-index.md`, `conversation-index.md`, and `workspace-copy.json`. Verification compares conversation messages against the live search index and checks exported notes and memory drops; check the source before assuming universal compatibility.
 
@@ -201,13 +224,15 @@ Older `NUWA_BACKUP_CONFIG` and `NUWA_BACKUP_USER_LABEL` environment variables re
 - `shared/`: local shared memory, projects, workflows, and optionally frozen subagent transcripts.
 - `workspace/`: shared workspace files, subject to configurable exclusions.
 - `conversations/`: monthly human-readable Markdown and raw JSONL from the platform-synchronized SQLite index. Non-assistant identifiers (such as `organization`, `people`, `procedures`) are not treated as assistants or displayed as `Unknown assistant`. The raw archive also keeps a consistent `conversations/search-index-snapshot.db` SQLite copy, including platform records that are not assistant conversations.
-- `platform-memory/`: readable RecallMemory export, when supplied.
+- `platform-memory/`: readable RecallMemory export, when supplied. `memory-pending.json` lists assistants that still have no drop.
+- `coverage.md`: the same coverage matrix as the readable export, probed from the box at export time.
 - `meta/`: file inventory, workspace omissions, and this program's git revision.
 
 ### Human-readable export: `virtual-office-<UTC>/`
 
 - `00-shared/`: available projects, shared memory, skills, **workspace outputs**.
-- `01-assistants/<name>/`: profiles, notes, **private** content, routines, attachments, conversations, memory.
+- `01-assistants/<name>/`: `instructions.md` (full prompt, or a reconstructed stand-in), `routines.md` (schedules or an unavailable marker), `connectors.md` (names and auth status only), profile, conversations, memory, and notes, private files, references, or attachments when those sources exist.
+- `coverage.md`: the matrix described above. `memory-pending.json` lists assistants that still need a memory drop.
 - `02-groups/<name>/`: group information and conversations.
 - `99-backup-program/`: source code version and conversation statistics.
 - `memory-index.md`, `conversation-index.md`, `workspace-copy.json`: export indexes.
@@ -243,7 +268,7 @@ For existing **legacy `.tar.gz`** backups (not produced by current versions), ke
 ### 2. If moving to another AI assistant (recommended first path)
 
 1. Start with the **Virtual Office** export. Read `README.md`, `roster.md`, and `conversation-index.md`; find the assistant under `01-assistants/<name>/`.
-2. Give the new assistant the relevant `profile.md`, `memory/`, `notes-and-profiles/`, `references/`, `routines/`, and monthly conversation Markdown, plus any shared knowledge under `00-shared/`. Copy attachments or workspace deliverables only as needed.
+2. Give the new assistant the relevant `instructions.md`, `profile.md`, `memory/`, `routines.md`, `connectors.md`, and monthly conversation Markdown, plus `notes-and-profiles/`, `references/`, or `routines/` when those folders exist, and any shared knowledge under `00-shared/`. Copy attachments or workspace deliverables only as needed. Read `coverage.md` before assuming a section is complete.
 3. Ask it to **summarize what it can actually understand and import**, map tasks and permissions in the new environment, and confirm missing memory or tools. Importing `memory/*.jsonl` into a new memory system requires that system's own supported import process; reading a file does not create native memory automatically.
 4. Recreate integrations, credentials, schedules, access controls, and approvals in the **new** system after reviewing them. Do not hand raw password files or tokens to a new assistant without checking that they are still needed and securely handled.
 
@@ -267,7 +292,10 @@ Backup data is **unencrypted** and may include credentials, confidential convers
 ## Limitations
 
 - Platform-provided `managed-skills/` and `plugin-skills/` (for example built-in skills installed by the host) are **intentionally not included**. Only user-authored `workflows/` are backed up. Built-in skills belong to the host's installed environment and may need to be reinstalled separately. This is an explicit scope limitation, not a statement that those files are inaccessible.
-- The platform search index generally provides visible conversation text. Tool calls and tool results can require older on-box transcripts; availability varies by environment.
+- The platform search index generally provides visible conversation text. Tool calls are probed in both `agent-transcripts/<id>/<id>.jsonl` and `agents/<id>/store.db` (`transcript_entries`). A hit is written to `conversations/raw/transcript.jsonl` and `conversations/transcript.md`. A miss leaves `tool calls: unavailable` in `conversations/README.md`.
+- Full system prompts are platform-hosted. `instructions.md` is always `source: reconstructed`: the profile description, the first handoff copied verbatim, and standing rules when a standing-rules file or field exists. The instructions cell is `unavailable`.
+- Routines come first from each memory drop's `routines.json`. Each item keeps `source` of `platform`, `box-cron`, `memory-drop`, or `inferred`. The raw file is copied to `routines/routines.json` and summarized in `routines.md`. Disk `crontab.txt`, `cron.json`, and schedule directories fill gaps. Inferred rows are guesses. If every source misses, `routines.md` says unavailable and the export prints **WARN**.
+- `memory-export-notes.json` is not a memory declaration. Delete a stale `memory-status.json` when facts exist; do not rename it.
 - Agent local SQLite copies may be live files. The conversation index is snapshot consistently, but **not every raw database is guaranteed to be a consistent snapshot**.
 - Local memory can be stale. The memory-drop process requires agent cooperation; exported-fact completeness is not technically guaranteed.
 - Different Grok Bot versions may use different internal storage layouts. Paths must be checked on the target box.

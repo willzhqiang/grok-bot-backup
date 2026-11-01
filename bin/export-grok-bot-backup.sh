@@ -143,6 +143,12 @@ python3 -m grok_bot_backup.conversations --dest "$DEST/conversations" >/dev/null
 # --- Platform memory drops (phase 1). Missing agents are not exported, never fatal. ---
 python3 -m grok_bot_backup.memory_drop --into-grok "$DEST" >/dev/null
 
+# Coverage matrix for this raw export (same probes as the readable pack).
+python3 -m grok_bot_backup.coverage \
+  --data-root "$AGENT_DATA" \
+  --stats "$DEST/conversations/conversation-stats.json" \
+  --out "$DEST"
+
 # --- Copy of this backup program: repo source at HEAD + commit hash ---
 python3 -m grok_bot_backup.program "$DEST/meta/backup-program" > "$DEST/meta/.program.out"
 PROGRAM_COMMIT="$(sed -n 's/^PROGRAM_COMMIT=//p' "$DEST/meta/.program.out")"
@@ -214,6 +220,7 @@ manifest = {
         "meta/backup-program/ (repo source at HEAD + COMMIT)",
         "platform-memory/ human-readable RecallMemory drops when MEMORY_DROP exists",
         "agents/<id>/platform-memory/ and shared/platform-memory/ raw jsonl from those drops",
+        "coverage.json and coverage.md (instructions, memory, routines, conversation, toolcalls, private, attachments, connectors)",
     ],
     "excluded": [
         "Host-level files outside the included trees are not deliberately copied; included folders can still contain secrets",
@@ -256,7 +263,8 @@ Exported from shared box computer.
 - `conversations/` — **full chat history of every assistant** (one folder per display name, monthly Markdown, Asia/Taipei); start at `conversations/README.md`
 - `shared/agent-transcripts/` — locally available transcript JSONL with tool calls (may be stale)
 - `shared/user-memory/`, `shared/projects/` — if present; check the source timestamps
-- `platform-memory/` — human-readable platform memory from RecallMemory drops (phase 1); index at `platform-memory/memory-index.md`
+- `platform-memory/` — human-readable platform memory from RecallMemory drops (phase 1); index at `platform-memory/memory-index.md`; gaps in `platform-memory/memory-pending.json`
+- `coverage.md` — per-assistant coverage matrix. `unavailable` was probed and not found; `missing` means a required piece did not land in the export
 - `agents/<id>/platform-memory/` — raw jsonl of that assistant's drop, if any
 - `workspace/` — shared work products / deliverables from `/workspace`
 - `meta/MANIFEST.json` — file inventory
