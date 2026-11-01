@@ -18,9 +18,18 @@ import zipfile
 import hashlib
 
 from .common import AGENT_DATA, SEARCH_INDEX, TAIPEI
+from .coverage import report_coverage
 
 ENTRY_RE = re.compile(r"^<!-- entry:(\S+) seq:(\S+) -->$", re.M)
 HDR_RE = re.compile(r"^### (\d{4}-\d{2}-\d{2}) \d{2}:\d{2}:\d{2} · ", re.M)
+
+
+def _declares_no_memories(path: pathlib.Path) -> bool:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeError):
+        return False
+    return isinstance(data, dict) and data.get("status") == "no_memories"
 
 
 def main() -> None:
@@ -30,6 +39,8 @@ def main() -> None:
     ap.add_argument("--date", help="Optional day to require at least one message (YYYY-MM-DD)")
     ap.add_argument("--strict", action="store_true",
                     help="Fail if memory drops are missing, empty without attestation, malformed or stale")
+    ap.add_argument("--coverage", action="store_true",
+                    help="Print the coverage matrix. With --strict, missing cells fail; unavailable cells warn")
     a = ap.parse_args()
     root = pathlib.Path(a.export_dir)
     ok = True
@@ -225,7 +236,16 @@ def main() -> None:
                 warn(f"{label}: zero memory facts; an empty file is not proof of a completed export "
                      "(supply a recent memory-status.json only after checking)")
         elif status.is_file():
-            warn(f"{label}: memory-status.json declares no memories but JSONL contains {facts} facts")
+            # Keep the filename memory-status.json. Do not rename it to hide a
+            # no_memories declaration that coexists with real facts.
+            if _declares_no_memories(status):
+                warn(f"{label}: memory-status.json declares no_memories but JSONL contains "
+                     f"{facts} facts; delete the stale declaration before export")
+            else:
+                warn(f"{label}: memory-status.json coexists with {facts} facts")
+        legacy = directory / "memory-export-notes.json"
+        if legacy.is_file():
+            warn(f"{label}: memory-export-notes.json is not a supported declaration; delete it")
 
     for agent in st["agents"]:
         name = agent["name"]
@@ -279,6 +299,9 @@ def main() -> None:
             if status_file.is_file():
                 check(sha(status_file) in exported_status_sha,
                       f"memory-status.json copied for {agent_dir.name}")
+
+    if not report_coverage(root, strict=a.strict, show=a.coverage):
+        ok = False
 
     print("RESULT", "OK" if ok else "FAILED")
     raise SystemExit(0 if ok else 1)

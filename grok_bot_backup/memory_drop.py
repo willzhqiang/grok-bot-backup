@@ -10,8 +10,9 @@ import json
 import os
 import pathlib
 import shutil
+from datetime import datetime, timezone
 
-from .common import AGENT_DATA, lock_down, safe_name, write
+from .common import AGENT_DATA, lock_down, safe_name, valid_agent_id, write
 
 MEMORY_DROP_DEFAULT = pathlib.Path(os.environ.get("WORKSPACE", "/workspace")) / "exports" / "memory-drop"
 
@@ -118,18 +119,42 @@ def _status_file(directory: pathlib.Path) -> pathlib.Path:
 
 
 def _agent_drop_files(agent_dir: pathlib.Path) -> list[pathlib.Path]:
+    """JSONL memory files plus routines.json. Status files stay separate."""
     if not agent_dir.is_dir():
         return []
     preferred = ["memory-profile.jsonl", "memory-agent.jsonl"]
     found = []
     for name in preferred:
-        p = agent_dir / name
-        if p.is_file():
-            found.append(p)
-    for p in sorted(agent_dir.glob("*.jsonl")):
-        if p not in found:
-            found.append(p)
+        path = agent_dir / name
+        if path.is_file():
+            found.append(path)
+    for path in sorted(agent_dir.glob("*.jsonl")):
+        if path not in found:
+            found.append(path)
+    routines = agent_dir / "routines.json"
+    if routines.is_file() and routines not in found:
+        found.append(routines)
     return found
+
+
+def _memory_jsonl_files(files: list[pathlib.Path]) -> list[pathlib.Path]:
+    return [path for path in files if path.suffix == ".jsonl"]
+
+
+def _routine_count(path: pathlib.Path) -> int:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return 0
+    if isinstance(data, list):
+        return len(data)
+    if isinstance(data, dict):
+        for key in ("routines", "items", "schedules", "jobs"):
+            if isinstance(data.get(key), list):
+                return len(data[key])
+        if any(key in data for key in ("name", "cron", "schedule", "prompt")):
+            return 1
+    return 0
 
 
 def _display_folder(agent_id: str, id_to_name: dict[str, str] | None) -> tuple[str, str]:
@@ -156,32 +181,56 @@ def _copy_jsonl(src: pathlib.Path, dst: pathlib.Path) -> None:
     shutil.copy2(src, dst)
 
 
+def _drop_record(agent_id: str, label: str, required: bool, directory: pathlib.Path) -> dict:
+    files = _agent_drop_files(directory)
+    counts = {path.name: len(load_jsonl(path)) for path in _memory_jsonl_files(files)}
+    routines = directory / "routines.json"
+    if routines.is_file():
+        counts["routines.json"] = _routine_count(routines)
+    return {
+        "id": agent_id,
+        "name": label,
+        "required": required,
+        "dropped": bool(files) or _status_file(directory).is_file(),
+        "explicit_empty": _status_file(directory).is_file() and not _memory_jsonl_files(files),
+        "files": counts,
+    }
+
+
+def _discovered_drop_dirs(root: pathlib.Path) -> list[pathlib.Path]:
+    agents_root = root / "agents"
+    if not agents_root.is_dir():
+        return []
+    found = []
+    for directory in sorted(agents_root.iterdir()):
+        if directory.is_dir() and (_agent_drop_files(directory) or _status_file(directory).is_file()):
+            found.append(directory)
+    return found
+
+
 def scan(root: pathlib.Path | None = None) -> dict:
-    """Status only: counts, no fact text."""
+    """Status only: counts, no fact text.
+
+    With no expected roster, every discovered agent id is a per-assistant row.
+    Additional drops are only directories outside that roster.
+    """
     root = root or drop_root()
     shared = root / "shared-user" / "memory-user.jsonl"
     shared_n = len(load_jsonl(shared)) if shared.is_file() else (0 if _status_file(root / "shared-user").is_file() else None)
+    discovered = _discovered_drop_dirs(root)
     agents = []
-    for aid, label, required in EXPECTED_AGENTS:
-        d = root / "agents" / aid
-        files = _agent_drop_files(d)
-        counts = {p.name: len(load_jsonl(p)) for p in files}
-        agents.append({
-            "id": aid,
-            "name": label,
-            "required": required,
-            "dropped": bool(files) or _status_file(d).is_file(),
-            "explicit_empty": _status_file(d).is_file(),
-            "files": counts,
-        })
-    # unexpected ids
     extra = []
-    agents_root = root / "agents"
-    known = {a[0] for a in EXPECTED_AGENTS}
-    if agents_root.is_dir():
-        for d in sorted(agents_root.iterdir()):
-            if d.is_dir() and d.name not in known and (_agent_drop_files(d) or _status_file(d).is_file()):
-                extra.append(d.name)
+    if EXPECTED_AGENTS:
+        for aid, label, required in EXPECTED_AGENTS:
+            agents.append(_drop_record(aid, label, required, root / "agents" / aid))
+        known = {agent[0] for agent in EXPECTED_AGENTS}
+        extra = [directory.name for directory in discovered if directory.name not in known]
+    else:
+        for directory in discovered:
+            if valid_agent_id(directory.name):
+                agents.append(_drop_record(directory.name, directory.name, False, directory))
+            else:
+                extra.append(directory.name)
     return {
         "drop_root": str(root),
         "drop_exists": root.is_dir(),
@@ -191,8 +240,42 @@ def scan(root: pathlib.Path | None = None) -> dict:
     }
 
 
+def _memory_summary(status: dict) -> tuple[int, int, list[str]]:
+    agents = status["agents"]
+    missing = [agent["name"] for agent in agents if not agent["dropped"]]
+    return sum(1 for agent in agents if agent["dropped"]), len(agents), missing
+
+
+def _last_drop_utc(directory: pathlib.Path) -> str | None:
+    if not directory.is_dir():
+        return None
+    times = [path.stat().st_mtime for path in directory.glob("*.jsonl") if path.is_file()]
+    if not times:
+        return None
+    return datetime.fromtimestamp(max(times), timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def pending_payload(status: dict, root: pathlib.Path) -> dict:
+    exported, expected, _missing = _memory_summary(status)
+    missing = []
+    for agent in status["agents"]:
+        if agent["dropped"]:
+            continue
+        missing.append({
+            "id": agent["id"],
+            "name": agent["name"],
+            "required": agent["required"],
+            "last_drop_utc": _last_drop_utc(root / "agents" / agent["id"]),
+        })
+    return {"exported": exported, "expected": expected, "missing": missing}
+
+
 def _index_markdown(status: dict) -> str:
+    exported, expected, missing = _memory_summary(status)
+    missing_text = ", ".join(missing) if missing else "none"
     lines = [
+        f"Memory export: {exported}/{expected}, missing: {missing_text}",
+        "",
         "# Platform memory index (phase 1)",
         "",
         f"Source: `{status['drop_root']}` (RecallMemory drop).",
@@ -231,6 +314,13 @@ def apply_tree(dest: pathlib.Path, id_to_name: dict[str, str] | None = None) -> 
     """
     root = drop_root()
     status = scan(root)
+    if id_to_name:
+        for agent in status["agents"]:
+            if agent["id"] in id_to_name:
+                agent["name"] = id_to_name[agent["id"]]
+    pending = pending_payload(status, root)
+    status["pending"] = pending
+    write(dest / "memory-pending.json", json.dumps(pending, ensure_ascii=False, indent=2))
     write(dest / "memory-index.md", _index_markdown(status))
 
     shared_src = root / "shared-user" / "memory-user.jsonl"
@@ -290,7 +380,7 @@ def _write_agent(dest, agent_id, label, drop_dir, id_to_name, dropped: bool) -> 
             if not note.exists():
                 write(note, f"# Platform memory\n\nnot exported\n\n({label}, `{agent_id}`)\n")
         return
-    files = _agent_drop_files(drop_dir)
+    files = _memory_jsonl_files(_agent_drop_files(drop_dir))
     status = _status_file(drop_dir)
     if status.is_file():
         _copy_jsonl(status, mem / "memory-status.json")
@@ -329,8 +419,11 @@ def apply_grok(dest: pathlib.Path) -> dict:
                 continue
             out = dest / "agents" / d.name / "platform-memory"
             out.mkdir(parents=True, exist_ok=True)
-            for src in files:
+            for src in _memory_jsonl_files(files):
                 _copy_jsonl(src, out / src.name)
+            routines = d / "routines.json"
+            if routines.is_file():
+                _copy_jsonl(routines, out / "routines.json")
             if status.is_file():
                 _copy_jsonl(status, out / "memory-status.json")
     return status
