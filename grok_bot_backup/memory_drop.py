@@ -177,6 +177,13 @@ def _display_folder(agent_id: str, id_to_name: dict[str, str] | None) -> tuple[s
 
 
 def _copy_jsonl(src: pathlib.Path, dst: pathlib.Path) -> None:
+    """Copy a regular JSONL or JSON file. Do not follow symlinks."""
+    if src.is_symlink() or not src.is_file():
+        return
+    from .sensitive import exclusion_reason
+    names = tuple(part for part in src.parts if part not in (os.sep, "/", ""))
+    if names and exclusion_reason(names, is_dir=False):
+        return
     dst.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(src, dst)
 

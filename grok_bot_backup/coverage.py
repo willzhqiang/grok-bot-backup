@@ -7,12 +7,24 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import pathlib
 import re
 import shutil
 import sqlite3
 
 from .common import safe_name, valid_agent_id, write
+from .sensitive import (
+    AVAILABILITY_NOTE,
+    classify_tree,
+    configured_reason,
+    copy_tree,
+    directory_kind,
+    exclusion_reason,
+    file_kind,
+    filtered_presence,
+    read_regular_text,
+)
 
 DIMENSIONS = (
     "instructions",
@@ -380,7 +392,15 @@ def render_instructions(name: str, probed: dict) -> str:
 
 
 def _skipped_routine_path(path: pathlib.Path) -> bool:
-    return "automation_completion_inbox" in path.parts
+    if "automation_completion_inbox" in path.parts:
+        return True
+    if path.is_symlink():
+        return True
+    try:
+        relative = path.parts
+    except (OSError, ValueError):
+        return True
+    return exclusion_reason(relative, is_dir=False) is not None
 
 
 def _origin(path: pathlib.Path, data_root: pathlib.Path) -> str:
@@ -620,9 +640,24 @@ def _routines_from_file(path: pathlib.Path, default_source: str, agent_id: str,
 
 
 def _files_under(root: pathlib.Path) -> list[pathlib.Path]:
-    if not root.is_dir():
+    if not root.is_dir() or root.is_symlink():
         return []
-    return sorted(path for path in root.rglob("*") if path.is_file() and not _skipped_routine_path(path))
+    found = []
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        parent = pathlib.Path(dirpath)
+        kept = []
+        for name in dirnames:
+            entry = parent / name
+            if entry.is_symlink() or directory_kind(name) or "automation_completion_inbox" in entry.parts:
+                continue
+            kept.append(name)
+        dirnames[:] = kept
+        for name in filenames:
+            path = parent / name
+            if path.is_symlink() or not path.is_file() or _skipped_routine_path(path):
+                continue
+            found.append(path)
+    return sorted(found)
 
 
 def _routines_from_db(db_path: pathlib.Path, origin_prefix: str) -> list[dict]:
@@ -787,31 +822,37 @@ _ENV_KEY = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=")
 
 
 def env_key_names(agent_dir: pathlib.Path) -> list[str]:
-    """Key names from on-disk env files. Values are never returned."""
+    """Key names from on-disk env files. Values are never returned or logged."""
     names = []
-    if not agent_dir.is_dir():
+    if not agent_dir.is_dir() or agent_dir.is_symlink():
         return names
-    for path in sorted(agent_dir.rglob("*.env")):
-        if not path.is_file() or _skipped_routine_path(path):
-            continue
-        try:
-            text = path.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            continue
-        rel = path.name
-        try:
-            rel = str(path.relative_to(agent_dir))
-        except ValueError:
-            pass
-        for line in text.splitlines():
-            stripped = line.strip()
-            if not stripped or stripped.startswith("#"):
+    for dirpath, dirnames, filenames in os.walk(agent_dir, followlinks=False):
+        parent = pathlib.Path(dirpath)
+        kept = []
+        for name in dirnames:
+            entry = parent / name
+            if entry.is_symlink() or directory_kind(name) or "automation_completion_inbox" in entry.parts:
                 continue
-            match = _ENV_KEY.match(stripped)
-            if match and not _SECRET_KEY.search(match.group(1)):
-                names.append(f"{rel}: {match.group(1)}")
-            elif match:
-                names.append(f"{rel}: {match.group(1)}")
+            kept.append(name)
+        dirnames[:] = kept
+        for name in filenames:
+            if file_kind(name) != "env file":
+                continue
+            path = parent / name
+            text = read_regular_text(path)
+            if text is None:
+                continue
+            try:
+                rel = path.relative_to(agent_dir).as_posix()
+            except ValueError:
+                rel = path.name
+            for line in text.splitlines():
+                stripped = line.strip()
+                if not stripped or stripped.startswith("#"):
+                    continue
+                match = _ENV_KEY.match(stripped)
+                if match:
+                    names.append(f"{rel}: {match.group(1)}")
     return names
 
 
@@ -826,13 +867,52 @@ def render_ui_secrets(name: str, key_names: list[str]) -> str:
         "",
     ]
     if key_names:
-        lines.append("On-disk env files list key names only:")
+        lines.append("On-disk env files list key names only. The files themselves are omitted")
+        lines.append("from the export by default. Values are not written here.")
         lines.append("")
         lines.extend(f"- `{item}`" for item in key_names)
     else:
-        lines.append("No on-disk env files were found.")
+        lines.append("No on-disk env files were found. Env files are omitted from the export by default.")
     lines.append("")
     return "\n".join(lines)
+
+
+def business_status(agent_dir: pathlib.Path, dest_parent: pathlib.Path | None) -> tuple[str, str]:
+    """Cell and note for business trees after credential and archive exclusions."""
+    trees = business_dirs(agent_dir)
+    if not trees:
+        return "unavailable", "unavailable"
+    eligible = blocked = copied = 0
+    names = []
+    for tree in trees:
+        relative = tree.relative_to(agent_dir).as_posix()
+        if exclusion_reason((tree.name,), is_dir=True) or configured_reason(relative, agent_dir):
+            blocked += 1
+            names.append(tree.name)
+            continue
+        found, omitted = classify_tree(tree)
+        eligible += found
+        blocked += omitted
+        names.append(tree.name)
+        if dest_parent is not None:
+            target = dest_parent / tree.name
+            if target.exists() or target.is_symlink():
+                copied_found, _copied_blocked = classify_tree(target)
+                copied += copied_found
+    if eligible == 0 and blocked == 0:
+        return "unavailable", "unavailable"
+    if eligible == 0:
+        return "partial", "only credential files or opaque archives were present; excluded by policy"
+    if dest_parent is None:
+        cell = "partial" if blocked else "ok"
+    elif copied < eligible:
+        cell = "missing" if copied == 0 else "partial"
+    else:
+        cell = "partial" if blocked else "ok"
+    note = ", ".join(names)
+    if blocked:
+        note += "; credential files or opaque archives excluded by policy"
+    return cell, note
 
 
 def business_dirs(agent_dir: pathlib.Path) -> list[pathlib.Path]:
@@ -1084,11 +1164,13 @@ def write_agent_views(dest: pathlib.Path, name: str, agent_dir: pathlib.Path,
     write(dest / "connectors.md", render_connectors(name, connectors, connector_cell))
     key_names = env_key_names(agent_dir)
     write(dest / "ui-only-secrets.md", render_ui_secrets(name, key_names))
-    trees = business_dirs(agent_dir)
-    for tree in trees:
-        shutil.copytree(tree, dest / tree.name, symlinks=True, dirs_exist_ok=True)
+    copy_reports = []
+    for tree in business_dirs(agent_dir):
+        if tree.is_symlink():
+            continue
+        copy_reports.append(copy_tree(tree, dest / tree.name, label=f"business-data/{tree.name}"))
     rules_cell = "ok" if instructions.get("standing_rules") else "unavailable"
-    business_cell = "ok" if trees else "unavailable"
+    business_cell, business_note = business_status(agent_dir, dest)
     return {
         "cells": {
             "instructions": "unavailable",
@@ -1103,9 +1185,10 @@ def write_agent_views(dest: pathlib.Path, name: str, agent_dir: pathlib.Path,
             "routines": routine_note(routines),
             "connectors": "unavailable" if not connectors else f"{len(connectors)} named",
             "standing-rules": "present" if rules_cell == "ok" else "not on disk",
-            "business-data-tree": "unavailable" if not trees else ", ".join(tree.name for tree in trees),
+            "business-data-tree": business_note,
             "ui-only-secrets": "platform UI secrets are not on disk",
         },
+        "copy_reports": copy_reports,
     }
 
 
@@ -1214,6 +1297,8 @@ def render_matrix(payload: dict) -> str:
         "",
         "`missing` fails `verify --strict`. `unavailable` warns and does not fail `--strict`.",
         "",
+        AVAILABILITY_NOTE,
+        "",
         header,
         rule,
     ]
@@ -1275,6 +1360,7 @@ def report_coverage(root: pathlib.Path, *, strict: bool, show: bool) -> bool:
                 unavailable += 1
                 print(f"WARN coverage {name} {dimension}: unavailable")
     print(f"COVERAGE missing={missing} unavailable={unavailable}")
+    print("COVERAGE note: " + AVAILABILITY_NOTE)
     return ok
 
 
@@ -1300,18 +1386,20 @@ def _records_from_box(data_root: pathlib.Path, out: pathlib.Path) -> list[dict]:
         routines = merge_routines(load_drop_routines(routines_file), probe_routines(agent_dir))
         connectors = probe_connectors(agent_dir, settings)
         name = profile.get("name") or agent_dir.name
+        dest_agent = out / "agents" / agent_dir.name
+        business_cell, business_note = business_status(agent_dir, dest_agent)
         records.append({
             "id": agent_dir.name,
             "name": name,
-            "memory_dir": out / "agents" / agent_dir.name / "platform-memory",
+            "memory_dir": dest_agent / "platform-memory",
             "cells": {
                 "instructions": "unavailable",
                 "routines": routines_cell(routines),
                 "connectors": connectors_cell(connectors),
-                "private": presence_cell(agent_dir / "private"),
-                "attachments": presence_cell(agent_dir / "attachments"),
+                "private": filtered_presence(agent_dir / "private", dest_agent / "private"),
+                "attachments": filtered_presence(agent_dir / "attachments", dest_agent / "attachments"),
                 "standing-rules": "ok" if instructions.get("standing_rules") else "unavailable",
-                "business-data-tree": "ok" if business_dirs(agent_dir) else "unavailable",
+                "business-data-tree": business_cell,
                 "ui-only-secrets": "unavailable",
             },
             "notes": {
@@ -1319,7 +1407,7 @@ def _records_from_box(data_root: pathlib.Path, out: pathlib.Path) -> list[dict]:
                 "routines": routine_note(routines),
                 "connectors": "unavailable" if not connectors else f"{len(connectors)} named",
                 "standing-rules": "present" if instructions.get("standing_rules") else "not on disk",
-                "business-data-tree": ", ".join(path.name for path in business_dirs(agent_dir)) or "unavailable",
+                "business-data-tree": business_note,
                 "ui-only-secrets": "platform UI secrets are not on disk",
             },
         })

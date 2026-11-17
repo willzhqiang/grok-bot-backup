@@ -86,6 +86,12 @@ class RoutineDropTests(unittest.TestCase):
             self.assertIn("unavailable", secrets)
             self.assertIn("FEISHU_WEBHOOK_URL", secrets)
             self.assertNotIn("do-not-copy", secrets)
+            self.assertFalse((folder / "private" / "feishu.env").exists())
+            exported_text = "\n".join(
+                path.read_text(encoding="utf-8", errors="replace")
+                for path in folder.rglob("*") if path.is_file() and not path.is_symlink()
+            )
+            self.assertNotIn("do-not-copy", exported_text)
             self.assertEqual(record["cells"]["ui-only-secrets"], "unavailable")
 
     def test_no_routines_stays_unavailable(self):

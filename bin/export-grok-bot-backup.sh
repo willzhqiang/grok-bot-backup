@@ -4,7 +4,9 @@
 #           conversation transcripts, user skills (workflows), workspace work products.
 #           + full chat history of every assistant from the platform-synced search index
 #             (conversations/<display-name>/YYYY-MM.md), + a copy of this program at its git commit.
-# NOTE: this is a FULL, SENSITIVE local backup. Included workspace and agent files may contain credentials. Never publish export archives.
+# NOTE: unencrypted local backup. Credential files, auth databases, and opaque
+# nested archives are excluded by filename rules. Ordinary files can still
+# contain secrets. Never publish export archives or print secret file contents.
 # Part of company-notes/grok-bot-backup; run directly.
 set -euo pipefail
 umask 077
@@ -19,8 +21,10 @@ STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 DEST="${OUT_ROOT}/grok-bot-export-${STAMP}"
 ARCHIVE="${OUT_ROOT}/grok-bot-export-${STAMP}.zip"
 
-# No private-content filtering: all accessible source files are eligible.
-# --include-private / --passphrase are still accepted for compatibility but ignored.
+# Credential files, authentication databases, and opaque archives are excluded
+# unless INCLUDE_CREDENTIAL_FILES, INCLUDE_AUTH_DATABASES, or
+# INCLUDE_OPAQUE_ARCHIVES is exactly 1. --include-private / --passphrase are
+# still accepted for compatibility but do not disable those rules.
 DEPRECATED_FLAG=0
 
 die() { echo "ERROR: $*" >&2; exit 1; }
@@ -28,7 +32,7 @@ die() { echo "ERROR: $*" >&2; exit 1; }
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --exclude)
-      [[ $# -ge 2 ]] || die "--exclude requires a workspace path"
+      [[ $# -ge 2 ]] || die "--exclude requires a path"
       export BACKUP_EXCLUDE_PATHS="${BACKUP_EXCLUDE_PATHS:+${BACKUP_EXCLUDE_PATHS}:}$2"
       shift 2 ;;
     --include-private) DEPRECATED_FLAG=1; shift ;;
@@ -36,11 +40,15 @@ while [[ $# -gt 0 ]]; do
     --passphrase=*) DEPRECATED_FLAG=1; shift ;;
     -h|--help)
       echo "Usage: $0"
-      echo "  Full backup of everything (no private-content filtering)."
+      echo "  Backup workspace and AGENT_DATA with conservative credential exclusions."
       echo "  Env: INCLUDE_SUBAGENTS=1 also copies sand-subagent transcripts."
       echo "       INCLUDE_BULKY_DIRS=1 copies .venv*, .cache, node_modules, __pycache__, .git."
-      echo "       BACKUP_EXCLUDE_PATHS='secrets:other-dir' excludes paths inside WORKSPACE."
-      echo "  --exclude PATH can be repeated; output directories are always excluded."
+      echo "       INCLUDE_CREDENTIAL_FILES=1 copies env files, private keys, cookie/session/token files."
+      echo "       INCLUDE_AUTH_DATABASES=1 copies authentication databases matched by filename."
+      echo "       INCLUDE_OPAQUE_ARCHIVES=1 copies nested zip/tar/7z/rar archives without inspecting them."
+      echo "       BACKUP_EXCLUDE_PATHS='secrets:other-dir' excludes those paths under every source root."
+      echo "  --exclude PATH can be repeated and applies to workspace and AGENT_DATA."
+      echo "  Output directories and previous export archives are always excluded."
       exit 0
       ;;
     *) die "unknown arg: $1" ;;
@@ -48,31 +56,31 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ "$DEPRECATED_FLAG" -eq 1 ]]; then
-  echo "NOTICE: --include-private/--passphrase are deprecated and ignored; the backup includes all accessible content." >&2
+  echo "NOTICE: --include-private/--passphrase are deprecated and ignored; credential filename rules still apply." >&2
 fi
 
 [[ -d "$AGENT_DATA" ]] || die "AGENT_DATA not found: $AGENT_DATA"
-echo "WARNING: Unencrypted full-data backup; credentials and secrets may be included." >&2
+echo "WARNING: Unencrypted backup. Credential files, auth databases, and opaque archives are excluded by filename rules. Ordinary notes, settings, memory, and conversations can still contain secrets." >&2
 echo "WORKSPACE=$WORKSPACE OUT_ROOT=$OUT_ROOT BACKUP_EXCLUDE_PATHS=${BACKUP_EXCLUDE_PATHS:-}" >&2
 mkdir -p "$DEST"/{agents,shared,workspace,meta}
 
 # Resolve symlink for clarity in manifest
 AGENT_DATA_REAL="$(readlink -f "$AGENT_DATA" 2>/dev/null || echo "$AGENT_DATA")"
 
-copy_tree() {
-  local src="$1" dst="$2"
-  if [[ -e "$src" ]]; then
-    mkdir -p "$(dirname "$dst")"
-    cp -a "$src" "$dst"
+copy_filtered() {
+  local src="$1" dst="$2" report="$3"
+  shift 3
+  if [[ -d "$src" ]]; then
+    python3 -m grok_bot_backup.tree_copy "$src" "$dst" --report "$report" "$@"
   fi
 }
 
-# --- Preserve ALL agent-data/agents entries, whether or not they are assistants. ---
+# --- Preserve agent-data/agents entries, whether or not they are assistants. ---
 # The agents/ root also contains organization/, people/, procedures/, top-level
-# JSON files, and sometimes other platform data. Copy the complete source tree
-# (including hidden files and private/), then count only genuine agent IDs.
+# JSON files, and sometimes other platform data. Copy that tree with the shared
+# credential, archive, and symlink rules, then count only genuine agent IDs.
 [[ -d "$AGENT_DATA/agents" ]] || die "Agent directory missing: $AGENT_DATA/agents"
-cp -a "$AGENT_DATA/agents/." "$DEST/agents/"
+copy_filtered "$AGENT_DATA/agents" "$DEST/agents" "$DEST/meta/agents-copy.json" --label agent-data/agents
 
 # --- Per-agent identity summary (only real UUID-named assistants) ---
 shopt -s nullglob
@@ -110,28 +118,25 @@ done
 # --- Shared user memory / projects (may be absent until first write) ---
 for d in user-memory projects; do
   if [[ -d "$AGENT_DATA/$d" ]]; then
-    cp -a "$AGENT_DATA/$d" "$DEST/shared/$d"
+    copy_filtered "$AGENT_DATA/$d" "$DEST/shared/$d" "$DEST/meta/${d}-copy.json" --label "agent-data/$d"
   fi
 done
 
 # User-authored skills (workflows). Skip Cursor managed-skills / plugin-skills.
 if [[ -d "$AGENT_DATA/workflows" ]]; then
-  cp -a "$AGENT_DATA/workflows" "$DEST/shared/workflows"
+  copy_filtered "$AGENT_DATA/workflows" "$DEST/shared/workflows" "$DEST/meta/workflows-copy.json" \
+    --label agent-data/workflows
 fi
 
-# Conversation transcripts (jsonl) — useful portable history
+# Conversation transcripts (jsonl) — useful portable history.
+# sand-subagent directories are skipped unless INCLUDE_SUBAGENTS=1.
 if [[ -d "$AGENT_DATA/agent-transcripts" ]]; then
-  mkdir -p "$DEST/shared/agent-transcripts"
-  # copy agent transcripts; skip sand-subagent noise unless INCLUDE_SUBAGENTS=1
-  shopt -s nullglob
-  for tdir in "$AGENT_DATA"/agent-transcripts/*/; do
-    base="$(basename "$tdir")"
-    if [[ "$base" == sand-subagent-* && "${INCLUDE_SUBAGENTS:-0}" != "1" ]]; then
-      continue
-    fi
-    cp -a "$tdir" "$DEST/shared/agent-transcripts/$base"
-  done
-  shopt -u nullglob
+  transcript_args=(--label agent-data/agent-transcripts)
+  if [[ "${INCLUDE_SUBAGENTS:-0}" != "1" ]]; then
+    transcript_args+=(--skip-dir-prefix sand-subagent-)
+  fi
+  copy_filtered "$AGENT_DATA/agent-transcripts" "$DEST/shared/agent-transcripts" \
+    "$DEST/meta/transcripts-copy.json" "${transcript_args[@]}"
 fi
 
 # --- Workspace contents; the only unconditional exclusion is our own export output. ---
@@ -154,6 +159,19 @@ python3 -m grok_bot_backup.program "$DEST/meta/backup-program" > "$DEST/meta/.pr
 PROGRAM_COMMIT="$(sed -n 's/^PROGRAM_COMMIT=//p' "$DEST/meta/.program.out")"
 rm -f "$DEST/meta/.program.out"
 
+# Combine copy reports. Paths and reasons only; file contents are never printed.
+python3 - "$DEST" <<'PY'
+import sys
+from pathlib import Path
+from grok_bot_backup.sensitive import combine_reports, load_copy_reports, write_json
+dest = Path(sys.argv[1])
+reports = load_copy_reports(dest / "meta")
+program = dest / "meta" / "backup-program"
+if program.is_dir():
+    reports.extend(load_copy_reports(program))
+write_json(dest / "meta" / "exclusion-report.json", combine_reports(reports))
+PY
+
 # --- Manifest ---
 python3 - "$DEST" "$AGENT_DATA" "$AGENT_DATA_REAL" "$STAMP" "$AGENT_COUNT" "$PROGRAM_COMMIT" <<'PY'
 import json, os, sys, hashlib, pathlib
@@ -169,6 +187,10 @@ program_commit = sys.argv[6]
 conv = json.loads((dest / "conversations" / "conversation-stats.json").read_text(encoding="utf-8"))
 conv_total = sum(a["messages"] for a in conv["agents"])
 workspace_report = json.loads((dest / "meta" / "workspace-copy.json").read_text(encoding="utf-8"))
+exclusion_path = dest / "meta" / "exclusion-report.json"
+exclusion_report = json.loads(exclusion_path.read_text(encoding="utf-8")) if exclusion_path.is_file() else {
+    "excluded": [], "excluded_count": 0, "limitations": [], "policy": {}, "coverage_note": "",
+}
 
 def file_list(root: pathlib.Path):
     rows = []
@@ -215,7 +237,7 @@ manifest = {
         "shared/workflows (user skills)",
         "shared/user-memory, shared/projects (if present)",
         "shared/agent-transcripts (excluding sand-subagent-* unless INCLUDE_SUBAGENTS=1)",
-        "workspace/ (excludes backup output and old generated archives, explicit excludes and default bulky directories; see meta/workspace-copy.json)",
+        "workspace/ and AGENT_DATA trees (credential files, auth databases, opaque archives, escaping symlinks, explicit excludes, and default bulky directories omitted; see meta/exclusion-report.json and meta/workspace-copy.json)",
         "conversations/<name>/YYYY-MM.md full chat history from search-index.db (+ raw/, attachment-index.md, frozen supplement)",
         "meta/backup-program/ (repo source at HEAD + COMMIT)",
         "platform-memory/ human-readable RecallMemory drops when MEMORY_DROP exists",
@@ -223,26 +245,33 @@ manifest = {
         "coverage.json and coverage.md (instructions, memory, routines, conversation, toolcalls, private, attachments, connectors)",
     ],
     "excluded": [
-        "Host-level files outside the included trees are not deliberately copied; included folders can still contain secrets",
+        "Credential files (env, private keys, cookie/session/token-store names, credential directories) unless INCLUDE_CREDENTIAL_FILES=1",
+        "Authentication databases matched by filename unless INCLUDE_AUTH_DATABASES=1",
+        "Opaque nested archives unless INCLUDE_OPAQUE_ARCHIVES=1; their contents are not inspected either way",
+        "Symlinks that leave the source tree or point at an excluded path",
+        "Filename rules do not detect secrets inside ordinary notes, settings, memory, or conversations",
+        "Host-level files outside the included trees are not deliberately copied",
         "managed-skills/, plugin-skills/ (Cursor-managed)",
-        "Only explicitly unselected sources are excluded; active platform index is also exported as conversation snapshots",
         "sand-subagent transcripts (default)",
+        exclusion_report.get("coverage_note") or "missing=0 is not full platform availability",
     ],
     "workspace_copy": workspace_report,
+    "exclusions": exclusion_report,
     "memory_drop": os.environ.get("MEMORY_DROP", os.path.join(os.environ.get("WORKSPACE", "/workspace"), "exports/memory-drop")),
     "include_subagents": os.environ.get("INCLUDE_SUBAGENTS", "0") == "1",
     "full_backup": not any(
         x.endswith("(bulky directory)") or x.endswith("(configured exclusion)")
         for x in workspace_report["skipped"]
     ) and os.environ.get("INCLUDE_SUBAGENTS", "0") == "1",
-    "full_backup_note": "This flag describes optional workspace/subagent exclusions only; platform memory or inaccessible sources may remain missing.",
+    "full_backup_note": "full_backup only reflects optional workspace bulky-directory and sand-subagent selections. It is not full platform availability. missing=0 does not mean every platform surface was exposed. Credential files, authentication databases, and opaque archives are omitted by default.",
     "notes": [
         "All assistants on one account share this computer filesystem.",
         "Per-agent identity/memory lives under agents/<id>/; skills under workflows/; scratch deliverables under /workspace.",
         "This archive is a portable backup for leaving Grok Bot lock-in; restoration is outside this tool.",
-        "Backup includes accessible notes, attachments and conversations without filtering private content.",
+        "Credential filenames, auth databases, and opaque archives are excluded by default. See meta/exclusion-report.json. This does not prove ordinary files are free of secrets.",
         "Local memory files can be stale; verify platform-memory drop freshness.",
         "Platform memory: copied from MEMORY_DROP when provided. Missing drops are marked not exported.",
+        "missing=0 is not full platform availability.",
     ],
     "file_count": len(files),
     "total_bytes": total_bytes,
@@ -271,7 +300,7 @@ Exported from shared box computer.
 - `meta/backup-program/` — the backup program used (repo source at commit `{program_commit}`)
 
 ## Excluded on purpose
-Host files outside selected trees and, by default, sand-subagent transcripts. Current output roots, prior grok-bot-export-* and virtual-office-* folders/archives, explicit excludes and optional bulky directories are listed in `meta/workspace-copy.json`.
+Credential files, authentication databases, opaque nested archives, and symlinks that leave the source tree. See `meta/exclusion-report.json`. Filename rules do not detect secrets inside ordinary notes, settings, memory, or conversations. `missing=0` is not full platform availability. Host files outside selected trees and, by default, sand-subagent transcripts are also omitted. Current output roots, prior grok-bot-export-* and virtual-office-* folders/archives, explicit excludes and optional bulky directories are listed in `meta/workspace-copy.json`.
 
 ## Re-run
 ```bash

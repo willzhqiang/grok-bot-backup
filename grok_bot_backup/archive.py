@@ -29,6 +29,9 @@ def create_zip(source: pathlib.Path, archive: pathlib.Path) -> pathlib.Path:
         raise FileExistsError(f"Temporary archive already exists: {temporary}")
 
     def add_node(zf: zipfile.ZipFile, path: pathlib.Path, arcname: str) -> None:
+        pure = pathlib.PurePosixPath(arcname)
+        if pure.is_absolute() or ".." in pure.parts:
+            raise ValueError(f"Unsafe archive path: {arcname}")
         # Check symlinks before directories or files. ZipFile.write follows
         # links, which would silently include out-of-scope or secret targets.
         if path.is_symlink():

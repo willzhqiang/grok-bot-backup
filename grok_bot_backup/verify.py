@@ -19,6 +19,9 @@ import hashlib
 
 from .common import AGENT_DATA, SEARCH_INDEX, TAIPEI
 from .coverage import report_coverage
+from .sensitive import exclusion_reason
+
+DEFAULT_MEMORY_MAX_AGE_DAYS = 2
 
 ENTRY_RE = re.compile(r"^<!-- entry:(\S+) seq:(\S+) -->$", re.M)
 HDR_RE = re.compile(r"^### (\d{4}-\d{2}-\d{2}) \d{2}:\d{2}:\d{2} · ", re.M)
@@ -44,7 +47,7 @@ def main() -> None:
     a = ap.parse_args()
     root = pathlib.Path(a.export_dir)
     ok = True
-    max_age_days = float(os.environ.get("MEMORY_MAX_AGE_DAYS", "2"))
+    max_age_days = float(os.environ.get("MEMORY_MAX_AGE_DAYS", str(DEFAULT_MEMORY_MAX_AGE_DAYS)))
     if max_age_days < 0:
         raise SystemExit("MEMORY_MAX_AGE_DAYS cannot be negative")
 
@@ -123,8 +126,24 @@ def main() -> None:
     # full backup: every source notes/ file must have a byte-identical copy in the export
     def sha(p: pathlib.Path) -> str:
         return hashlib.sha256(p.read_bytes()).hexdigest()
-    exported = {sha(p) for p in root.rglob("*") if p.is_file() and p.stat().st_size}
-    src = [p for p in (AGENT_DATA / "agents").glob("*/notes/**/*") if p.is_file() and p.stat().st_size]
+    exported = set()
+    for path in root.rglob("*"):
+        if path.is_symlink() or not path.is_file():
+            continue
+        if path.stat().st_size:
+            exported.add(sha(path))
+
+    def _note_excluded(path: pathlib.Path) -> bool:
+        if path.is_symlink():
+            return True
+        try:
+            relative = path.relative_to(AGENT_DATA / "agents")
+        except ValueError:
+            return True
+        return exclusion_reason(relative.parts, is_dir=False) is not None
+
+    src = [p for p in (AGENT_DATA / "agents").glob("*/notes/**/*")
+           if p.is_file() and not _note_excluded(p) and p.stat().st_size]
     missing = [p for p in src if sha(p) not in exported]
     check(not missing, f"all notes files included ({len(src) - len(missing)}/{len(src)})")
     for p in missing[:20]:

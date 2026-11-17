@@ -1,15 +1,18 @@
 """Copy workspace files without ever copying backup output into itself.
 
-All accessible files (including secrets) are included by default. Operators can
-exclude arbitrary paths with BACKUP_EXCLUDE_PATHS, separated by os.pathsep (: on
-Linux). The active OUT_ROOT and WORKSPACE/exports are always excluded.
+Credential files, authentication databases, and opaque archives are excluded by
+the shared policy in grok_bot_backup.sensitive. Operators can exclude more paths
+with BACKUP_EXCLUDE_PATHS, separated by os.pathsep (: on Linux). The same
+relative pattern is applied to every source root, not only this workspace.
+The active OUT_ROOT and WORKSPACE/exports are always excluded.
 """
 from __future__ import annotations
 
 import json
 import os
 from pathlib import Path
-import shutil
+
+from .sensitive import copy_tree
 
 
 def bulky(name: str) -> bool:
@@ -59,7 +62,8 @@ def copy_workspace(src: Path, dst: Path, out_root: Path) -> dict:
 
     Refuses unsafe output locations before making any copy. Paths are compared
     by resolved absolute location, preventing recursion through nested folders
-    or symbolic links. Symlinks in included trees are preserved, not followed.
+    or symbolic links. In-tree symlinks are preserved. Links that leave the
+    workspace, or that point at an excluded path, are omitted and not followed.
     """
     include = enabled()
     src = src.resolve()
@@ -73,40 +77,28 @@ def copy_workspace(src: Path, dst: Path, out_root: Path) -> dict:
         raise ValueError(f"Destination inside WORKSPACE but outside OUT_ROOT: {dst}")
 
     excluded = exclusions(src, output)
-    skipped: list[str] = []
 
-    def ignored(parent: str, names: list[str]) -> set[str]:
-        omissions = set()
-        for name in names:
-            path = Path(parent) / name
-            target = path.resolve()
+    def extra(entry: Path, rel: str) -> str | None:
+        if not entry.is_symlink():
+            try:
+                target = entry.resolve()
+            except OSError:
+                target = entry
             reason = next((why for root, why in excluded.items()
                            if target == root or root in target.parents), None)
-            if reason is None:
-                reason = generated_backup_artifact(path)
-            if reason is None and not include and path.is_dir() and bulky(name):
-                reason = "bulky directory"
-            if reason is not None:
-                omissions.add(name)
-                skipped.append(f"{path.relative_to(src)} ({reason})")
-        return omissions
+            if reason:
+                return reason
+        reason = generated_backup_artifact(entry)
+        if reason:
+            return reason
+        if not include and entry.is_dir() and bulky(entry.name):
+            return "bulky directory"
+        return None
 
-    dst.mkdir(parents=True, exist_ok=True)
-    for entry in src.iterdir():
-        if entry.name in ignored(str(src), [entry.name]):
-            continue
-        target = dst / entry.name
-        if entry.is_symlink():
-            target.symlink_to(os.readlink(entry))
-        elif entry.is_dir():
-            shutil.copytree(entry, target, ignore=ignored, symlinks=True, dirs_exist_ok=True)
-        elif entry.is_file():
-            shutil.copy2(entry, target)
-    return {
-        "include_bulky_dirs": include,
-        "excluded_roots": [str(p) for p in sorted(excluded)],
-        "skipped": sorted(set(skipped)),
-    }
+    report = copy_tree(src, dst, extra_reason=extra, label="workspace")
+    report["include_bulky_dirs"] = include
+    report["excluded_roots"] = [str(path) for path in sorted(excluded)]
+    return report
 
 
 if __name__ == "__main__":

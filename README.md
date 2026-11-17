@@ -22,7 +22,7 @@ bin/export-grok-bot-backup.sh         # Raw data + portable conversations
 bin/export-virtual-office.sh         # Human-readable Markdown handover
 ```
 
-Backups are created under `OUT_ROOT` (default: `/workspace/exports`). Each command prints its output paths. **Both commands produce a standard `.zip` archive** (alongside the uncompressed export folder), which can be opened with Windows File Explorer. No additional compression utility or Python install is needed to *extract* the ZIP on Windows. **Neither command encrypts its results.** All accessible content, including passwords, private files, attachments, and credentials, is included by default. Restrictive Unix permissions do not replace encryption. Store the resulting archives wherever your own policy requires, and never commit real exports to a public repository.
+Backups are created under `OUT_ROOT` (default: `/workspace/exports`). Each command prints its output paths. **Both commands produce a standard `.zip` archive** (alongside the uncompressed export folder), which can be opened with Windows File Explorer. No additional compression utility or Python install is needed to *extract* the ZIP on Windows. **Neither command encrypts its results.** Env files, private keys, cookie and session stores, token-store filenames, credential directories, authentication databases, and opaque nested archives are **omitted by default**. Ordinary notes, settings, memory, conversations, and source files are still copied and can contain secrets; filename rules do not read file contents. Restrictive Unix permissions do not replace encryption. Store the resulting archives wherever your own policy requires, and never commit real exports to a public repository.
 
 **Disk-space planning:** there is no fixed minimum. Size depends on your source data. Allow room for the uncompressed export directory **and** its compressed archive, plus headroom for other agents using the box. If the disk is limited, consider excluding large regenerable directories or choosing an external `OUT_ROOT`.
 
@@ -51,7 +51,7 @@ The shipped `config.example.json` uses `"expected_agents": []`, so copying it un
 }
 ```
 
-Use `required: true` only for assistants you actually expect on your own box; `required: false` marks an optional assistant. The roster controls expectations for memory-drop reporting, not what private or shared content is copied. The backup will not filter content by sensitivity.
+Use `required: true` only for assistants you actually expect on your own box; `required: false` marks an optional assistant. The roster controls expectations for memory-drop reporting. It does not disable the credential, archive, or symlink rules below.
 
 ### Opening the ZIP on Windows
 
@@ -69,37 +69,63 @@ bin/verify-export.sh /workspace/exports/grok-bot-export-<UTC> --archive /workspa
 
 Old `.tar.gz` backups remain readable by supported archive tools and can still be passed to `verify-export.sh --archive`. The exporter no longer creates new `.tar.gz` files by default.
 
-## Selective exclusions: full content by default
+## What is excluded by default
 
-Both export commands use the same safe workspace copier. They **always** exclude the currently configured `OUT_ROOT` and `$WORKSPACE/exports` (even if `OUT_ROOT` points elsewhere), as well as any pre-existing `grok-bot-export-*` or `virtual-office-*` directories and their `.tar`, `.tar.gz`, `.tgz` or `.zip` archives **anywhere within the copied workspace**. This prevents re-ingesting old archives even if they were stored outside today's output folder. Skipped paths are reported in the workspace copy reports.
+Both the raw export and the Virtual Office export use the same rules on **every source root**: `AGENT_DATA` (agents, private files, `backup_pre`, projects, workflows, user memory, transcripts), `WORKSPACE`, memory-drop files that match a credential name, business-data trees copied into the readable pack, and the embedded program snapshot.
 
-Everything else under the accessible workspace, **including `secrets/`**, is eligible for backup unless excluded explicitly. There is no sensitive-content filter. Agents' `private/` folders are also included.
+A path is excluded when a **path component or filename matches exactly** (case-insensitive), or when the extension is a known private-key or archive extension. Matching is not a substring search. These names stay in the backup:
+
+- `src/token_parser.py`, `tokenizer.py`, `design-tokens.css`
+- `session-notes.md`, `notes/token-handling.md`
+- `settings.json` keys such as `max_tokens` and `theme`
+- `profile.json`, instructions, standing rules, memory JSONL, and conversations
+- ordinary `private/note.txt` and `store.db` / `search-index.db`
+
+These are omitted unless you opt in:
+
+| Kind | Examples | Opt-in |
+| --- | --- | --- |
+| Env files | `.env`, `.env.local`, `feishu.env` | `INCLUDE_CREDENTIAL_FILES=1` |
+| Private keys | `id_rsa`, `*.pem`, `*.key`, `*.p12` | `INCLUDE_CREDENTIAL_FILES=1` |
+| Cookie, session, and token-store files | `cookies.txt`, `session.json`, `token.json`, `.netrc` | `INCLUDE_CREDENTIAL_FILES=1` |
+| Credential directories | `secrets/`, `.ssh/`, `.aws/`, `sessions/`, `cookies/`, `token-store/` | `INCLUDE_CREDENTIAL_FILES=1` |
+| Authentication databases | `cookies.sqlite`, `auth.db`, `Login Data`, `*.kdbx`, and their `-wal`/`-shm`/`-journal` sidecars | `INCLUDE_AUTH_DATABASES=1` |
+| Opaque nested archives | `*.zip`, `*.tar`, `*.tar.gz`, `*.tgz`, `*.7z`, `*.rar`, including `migration/box-files.tar.gz` | `INCLUDE_OPAQUE_ARCHIVES=1` |
+
+Opt-in copies those files **without opening them** and without removing secrets inside an archive. Previous `grok-bot-export-*` and `virtual-office-*` directories and archives stay excluded even when `INCLUDE_OPAQUE_ARCHIVES=1`. `store.db` and the search index are not treated as authentication databases and are not scanned for credentials.
+
+Symlinks that point outside the source tree, or at an excluded path, are dropped and never followed. In-tree links to ordinary files are stored as links. The ZIP writer also stores links as links and refuses archive names that are absolute or contain `..`.
+
+`BACKUP_EXCLUDE_PATHS` and repeated `--exclude` add more skips on **every** source root. A relative pattern matches a path-component sequence at any depth: `secrets` matches `secrets/file` and `a/secrets/file`, and does not match `secrets-notes.md`. An absolute pattern matches that filesystem location. Output directories are always excluded.
 
 ```bash
-# Include any secrets by default:
+# Default: credential files, auth databases, and nested archives are omitted.
 bin/export-grok-bot-backup.sh
+bin/export-virtual-office.sh
 
-# Optional: skip a particular workspace directory:
-bin/export-grok-bot-backup.sh --exclude secrets
-bin/export-virtual-office.sh --exclude secrets
+# Also skip a directory under the workspace and under AGENT_DATA:
+bin/export-grok-bot-backup.sh --exclude custom-skip
+bin/export-virtual-office.sh --exclude custom-skip
 
-# Multiple workspace-relative or absolute paths (Linux path separator ':'):
-BACKUP_EXCLUDE_PATHS="secrets:old-archives:/mnt/other-data" bin/export-grok-bot-backup.sh
+# Several relative or absolute paths (Linux path separator ':'):
+BACKUP_EXCLUDE_PATHS="custom-skip:old-archives:/mnt/other-data" bin/export-grok-bot-backup.sh
 
-# Or repeat the command-line option:
-bin/export-virtual-office.sh --exclude secrets --exclude old-archives
+# Unsafe opt-in. This puts the named files into the unencrypted archive.
+INCLUDE_CREDENTIAL_FILES=1 INCLUDE_AUTH_DATABASES=1 INCLUDE_OPAQUE_ARCHIVES=1 bin/export-grok-bot-backup.sh
 ```
 
-The `BACKUP_EXCLUDE_PATHS` variable and `--exclude` options apply to **workspace paths**. They do not automatically filter agent memory, conversations, or private content in `AGENT_DATA`. Exclusions are recorded in the raw export's `meta/workspace-copy.json` and the Virtual Office export's `workspace-copy.json`.
+Each skip is a path plus a reason. The raw export writes `meta/exclusion-report.json` and `meta/workspace-copy.json`. The Virtual Office export writes `exclusion-report.json` and `workspace-copy.json`. Reports do not contain file contents. Logs do not print secret values.
 
-Large build/caching directories (`.venv*`, `.cache`, `node_modules`, `__pycache__`, `.git`) are skipped by default to control size; use `INCLUDE_BULKY_DIRS=1` to include them. To include the optional sand-subagent transcripts in the raw export, use `INCLUDE_SUBAGENTS=1`:
+**These rules do not prove an archive is free of secrets.** A password written inside a note, a settings value, a memory fact, a conversation, or a source file is still copied. An unusually named database or archive is not recognized. Do not describe filename filtering as a guarantee.
+
+Both commands also **always** exclude the configured `OUT_ROOT` and `$WORKSPACE/exports` (even if `OUT_ROOT` points elsewhere), plus pre-existing `grok-bot-export-*` or `virtual-office-*` directories and their archives anywhere in the copied workspace. Large build directories (`.venv*`, `.cache`, `node_modules`, `__pycache__`, `.git`) are skipped in the workspace unless `INCLUDE_BULKY_DIRS=1`. Sand-subagent transcripts are skipped unless `INCLUDE_SUBAGENTS=1`.
 
 ```bash
 INCLUDE_BULKY_DIRS=1 INCLUDE_SUBAGENTS=1 bin/export-grok-bot-backup.sh
 INCLUDE_BULKY_DIRS=1 bin/export-virtual-office.sh
 ```
 
-**Warning:** "All accessible data" cannot include information the local platform does not expose. See memory preparation below.
+**Warning:** A finished export still cannot include information the local platform does not expose. See memory preparation below. `missing=0` is not full platform availability.
 
 ## Prepare platform memory *before* backup
 
@@ -195,7 +221,7 @@ With no `config.json` roster, `memory-index.md` lists agent ids discovered under
 | `unavailable` | The probes ran and the platform did not have this on disk |
 | `missing` | A required piece was absent from the export |
 
-`verify --coverage` prints the matrix. With `--strict`, a `missing` cell fails the run. An `unavailable` cell prints **WARN** and does not, by itself, fail `--strict`. A platform-hosted system prompt is `unavailable` (see instructions below), not a permanent failure.
+`verify --coverage` prints the matrix and `COVERAGE missing=<n> unavailable=<n>`. **`missing=0` is not full platform availability.** Unavailable cells were probed and not found on disk; that does not prove the platform has no such data. With `--strict`, a `missing` cell fails the run. An `unavailable` cell prints **WARN** and does not, by itself, fail `--strict`. A platform-hosted system prompt is `unavailable` (see instructions below), not a permanent failure. Credential files that were omitted on purpose make a private or business-data cell `partial` when other files remain, or `partial` when the only files were excluded. That is not a `missing` memory failure.
 
 Inspect the raw export's `meta/MANIFEST.json`, `meta/workspace-copy.json`, and `platform-memory/memory-index.md` for included data, exclusions, and RecallMemory status. The readable export has `memory-index.md`, `conversation-index.md`, and `workspace-copy.json`. Verification compares conversation messages against the live search index and checks exported notes and memory drops; check the source before assuming universal compatibility.
 
@@ -206,9 +232,12 @@ Inspect the raw export's `meta/MANIFEST.json`, `meta/workspace-copy.json`, and `
 | `AGENT_DATA` | `/home/box/agent-data` | Root of the local platform agent data |
 | `WORKSPACE` | `/workspace` | Shared workspace |
 | `OUT_ROOT` | `$WORKSPACE/exports` | Backup destination; automatically excluded |
-| `BACKUP_EXCLUDE_PATHS` | empty | Optional colon-separated workspace paths to omit |
-| `INCLUDE_BULKY_DIRS` | `0` | Set `1` to include large dependency/cache folders |
-| `INCLUDE_SUBAGENTS` | `0` | Set `1` to include sand-subagent transcripts in raw backup |
+| `BACKUP_EXCLUDE_PATHS` | empty | Optional colon-separated paths to omit under every source root |
+| `INCLUDE_BULKY_DIRS` | `0` | Set `1` to include large dependency/cache folders in the workspace |
+| `INCLUDE_SUBAGENTS` | `0` | Set `1` to include sand-subagent transcripts in the raw backup |
+| `INCLUDE_CREDENTIAL_FILES` | `0` | Set `1` to copy env files, private keys, cookie/session/token files, and credential directories. Unsafe |
+| `INCLUDE_AUTH_DATABASES` | `0` | Set `1` to copy authentication databases matched by filename. They are not inspected |
+| `INCLUDE_OPAQUE_ARCHIVES` | `0` | Set `1` to copy nested zip/tar/7z/rar archives. Contents are not filtered |
 | `MEMORY_DROP` | `$WORKSPACE/exports/memory-drop` | Pre-exported platform memory files |
 | `MEMORY_MAX_AGE_DAYS` | `2` | Max age of a memory drop before WARN / strict FAIL |
 | `GROK_BACKUP_CONFIG` | `<repo>/config.json` | Optional expected agent roster |
@@ -220,9 +249,9 @@ Older `NUWA_BACKUP_CONFIG` and `NUWA_BACKUP_USER_LABEL` environment variables re
 
 ### Raw export: `grok-bot-export-<UTC>/`
 
-- `agents/`: **complete accessible source tree**, including actual assistant UUID directories (with `private/`, notes, settings, attachments and databases), plus non-assistant directories such as `organization/`, `people/`, `procedures/` and top-level metadata such as `active-agent.json` and `audit-outbox.json`. These non-assistant entries are preserved as raw data but **never counted as assistants**.
+- `agents/`: accessible assistant and non-assistant source files after the exclusions above, including ordinary `private/` notes, settings, attachments, and databases such as `store.db`, plus `organization/`, `people/`, `procedures/`, `active-agent.json`, and `audit-outbox.json` when those are ordinary files. Non-assistant entries are **never counted as assistants**. Credential files and nested archives inside `private/backup_pre/` or `migration/` are omitted by default.
 - `shared/`: local shared memory, projects, workflows, and optionally frozen subagent transcripts.
-- `workspace/`: shared workspace files, subject to configurable exclusions.
+- `workspace/`: shared workspace files, subject to the same credential, archive, symlink, and configured exclusions.
 - `conversations/`: monthly human-readable Markdown and raw JSONL from the platform-synchronized SQLite index. Non-assistant identifiers (such as `organization`, `people`, `procedures`) are not treated as assistants or displayed as `Unknown assistant`. The raw archive also keeps a consistent `conversations/search-index-snapshot.db` SQLite copy, including platform records that are not assistant conversations.
 - `platform-memory/`: readable RecallMemory export, when supplied. `memory-pending.json` lists assistants that still have no drop.
 - `coverage.md`: the same coverage matrix as the readable export, probed from the box at export time.
@@ -297,15 +326,31 @@ Backup data is **unencrypted** and may include credentials, confidential convers
 - Routines come first from each memory drop's `routines.json`. Each item keeps `source` of `platform`, `box-cron`, `memory-drop`, or `inferred`. The raw file is copied to `routines/routines.json` and summarized in `routines.md`. Disk `crontab.txt`, `cron.json`, and schedule directories fill gaps. Inferred rows are guesses. If every source misses, `routines.md` says unavailable and the export prints **WARN**.
 - `memory-export-notes.json` is not a memory declaration. Delete a stale `memory-status.json` when facts exist; do not rename it.
 - Agent local SQLite copies may be live files. The conversation index is snapshot consistently, but **not every raw database is guaranteed to be a consistent snapshot**.
-- Local memory can be stale. The memory-drop process requires agent cooperation; exported-fact completeness is not technically guaranteed.
+- Filename exclusions do not read file contents. Secrets in ordinary prose, settings values, memory facts, and conversations can remain in the archive. Opaque archives and authentication databases are identified by name; opting in copies them whole without inspection. `missing=0` is not full platform availability.
+- Local memory can be stale. The memory-drop process requires agent cooperation; exported-fact completeness is not technically guaranteed. `MEMORY_MAX_AGE_DAYS` defaults to 2. `--strict` still fails when a memory drop is missing, stale, empty without a real declaration, or contradictory.
 - Different Grok Bot versions may use different internal storage layouts. Paths must be checked on the target box.
 - This is an **export**, not an automatic restore workflow. Recovery/rehydration into a new provider must be planned separately.
 
-## Test
+## Local installation and synthetic verification
+
+Use a public clone and the synthetic fixtures in `tests/`. This does not read a live agent, a private backup, rclone, or an account, and it does not change schedules.
 
 ```bash
+git clone https://github.com/company-notes/grok-bot-backup.git
+cd grok-bot-backup
+python3 -m venv .venv
+. .venv/bin/activate
 python3 -m compileall -q grok_bot_backup tests
 bash -n bin/*.sh
+python3 -m unittest discover -s tests -v
+```
+
+No third-party packages are required. Python 3.12 or newer is the version used in CI. The credential regression test builds a temporary `AGENT_DATA` and `WORKSPACE`, runs both export commands, and checks that synthetic secret strings are absent from the ZIP members, the manifest, the exclusion report, and the command output. It also checks that ordinary token-related source, session notes, private notes, settings, memory, and conversations remain, and that a missing memory drop still fails `verify --strict`.
+
+To inspect one synthetic run yourself, the same layout the test builds is enough: point `AGENT_DATA`, `WORKSPACE`, `OUT_ROOT`, and `MEMORY_DROP` at temporary directories you created, run `bin/export-grok-bot-backup.sh` and `bin/export-virtual-office.sh`, then search the ZIP for a marker that you put only in an excluded file. Do not point those variables at a real home directory or a real backup for this check. Checking a private computer's real export is a separate later step; do not upload that archive or paste secret file contents into an issue.
+
+```bash
+python3 -m unittest tests.test_credential_filter -v
 python3 -m unittest discover -s tests -v
 ```
 

@@ -16,7 +16,7 @@ import shutil
 
 
 from . import conversations
-from .coverage import assemble_rows, presence_cell, write_agent_views, write_reports
+from .coverage import assemble_rows, write_agent_views, write_reports
 from .memory_drop import apply_tree as apply_memory_drop, drop_root
 from .common import (
     AGENT_DATA, OUT_ROOT, WORKSPACE, add_deprecated_private_args, copy_if,
@@ -24,24 +24,42 @@ from .common import (
 )
 from .archive import create_zip
 from .program import snapshot_program
+from .sensitive import (
+    combine_reports, copy_tree, exclusion_reason, filtered_presence, redact_exact_secret_keys,
+    write_json,
+)
 from .workspace import copy_workspace
 
 STAMP = utc_stamp()
 DEST = OUT_ROOT / f"virtual-office-{STAMP}"
 
 
-def _copy_tree(src: pathlib.Path, dst: pathlib.Path) -> int:
-    copied = 0
-    if not src.exists():
+def _copy_tree(src: pathlib.Path, dst: pathlib.Path, exclusions: list | None = None,
+               label: str | None = None) -> int:
+    if not src.exists() or src.is_symlink() or not src.is_dir():
         return 0
-    for path in src.rglob("*"):
-        if path.is_file():
-            copy_if(path, dst / path.relative_to(src))
-            copied += 1
-    return copied
+    report = copy_tree(src, dst, label=label or src.name)
+    if exclusions is not None:
+        exclusions.append(report)
+    return report["copied_files"]
 
 
-def export_agent(agent_dir: pathlib.Path, dest_agents: pathlib.Path, id_to_name: dict) -> dict | None:
+def _safe_markdown(root: pathlib.Path) -> list[pathlib.Path]:
+    if not root.is_dir() or root.is_symlink():
+        return []
+    found = []
+    for path in root.rglob("*.md"):
+        if path.is_symlink() or not path.is_file():
+            continue
+        relative = path.relative_to(root)
+        if exclusion_reason(relative.parts, is_dir=False):
+            continue
+        found.append(path)
+    return found
+
+
+def export_agent(agent_dir: pathlib.Path, dest_agents: pathlib.Path, id_to_name: dict,
+                 exclusions: list | None = None) -> dict | None:
     profile_path = agent_dir / "profile.json"
     if not profile_path.exists() or (agent_dir / "group.json").exists():
         return None
@@ -74,7 +92,7 @@ def export_agent(agent_dir: pathlib.Path, dest_agents: pathlib.Path, id_to_name:
 ## Settings summary
 
 ```json
-{json.dumps(settings, ensure_ascii=False, indent=2)}
+{json.dumps(redact_exact_secret_keys(settings), ensure_ascii=False, indent=2)}
 ```
 """)
 
@@ -83,20 +101,17 @@ def export_agent(agent_dir: pathlib.Path, dest_agents: pathlib.Path, id_to_name:
 
     # memory (local files may be outdated; check source timestamps)
     mem = agent_dir / "memory"
-    if mem.exists():
-        for p in mem.rglob("*"):
-            if p.is_file():
-                copy_if(p, folder / "memory" / p.relative_to(mem))
+    if _copy_tree(mem, folder / "memory", exclusions, label="agent-memory"):
         parts = ["# Memory summary\n", "> Local memory files may be incomplete or outdated; consult memory-index.md for platform memory drops.\n"]
-        for p in sorted(mem.rglob("*.md")):
-            parts.append(f"## {p.relative_to(mem)}\n\n{p.read_text(encoding='utf-8', errors='replace')}\n")
+        for p in _safe_markdown(folder / "memory"):
+            parts.append(f"## {p.relative_to(folder / 'memory')}\n\n{p.read_text(encoding='utf-8', errors='replace')}\n")
         write(folder / "memory-summary.md", "\n".join(parts))
 
     copied = {
-        "attachments-and-work": _copy_tree(agent_dir / "attachments", folder / "attachments-and-work"),
-        "references": _copy_tree(agent_dir / "reference", folder / "references"),
-        "private": _copy_tree(agent_dir / "private", folder / "private"),
-        "notes-and-profiles": _copy_tree(agent_dir / "notes", folder / "notes-and-profiles"),
+        "attachments-and-work": _copy_tree(agent_dir / "attachments", folder / "attachments-and-work", exclusions, "attachments"),
+        "references": _copy_tree(agent_dir / "reference", folder / "references", exclusions, "reference"),
+        "private": _copy_tree(agent_dir / "private", folder / "private", exclusions, "private"),
+        "notes-and-profiles": _copy_tree(agent_dir / "notes", folder / "notes-and-profiles", exclusions, "notes"),
     }
     handoff = conversations.first_user_message(agent_dir.name)
     routines_file = drop_root() / "agents" / agent_dir.name / "routines.json"
@@ -104,8 +119,10 @@ def export_agent(agent_dir: pathlib.Path, dest_agents: pathlib.Path, id_to_name:
         folder, name, agent_dir, profile, settings,
         handoff=handoff, routines_file=routines_file,
     )
-    views["cells"]["private"] = presence_cell(agent_dir / "private", folder / "private")
-    views["cells"]["attachments"] = presence_cell(agent_dir / "attachments", folder / "attachments-and-work")
+    views["cells"]["private"] = filtered_presence(agent_dir / "private", folder / "private")
+    views["cells"]["attachments"] = filtered_presence(agent_dir / "attachments", folder / "attachments-and-work")
+    if exclusions is not None:
+        exclusions.extend(views.get("copy_reports") or [])
     if views["cells"]["instructions"] == "unavailable":
         print(f"WARN instructions unavailable: {name} source={views['notes'].get('instructions')}", flush=True)
     if views["cells"]["routines"] == "unavailable":
@@ -152,7 +169,8 @@ This is a portable virtual employee/role package that a person can read or impor
     }
 
 
-def export_group(group_dir: pathlib.Path, dest_groups: pathlib.Path, id_to_name: dict) -> None:
+def export_group(group_dir: pathlib.Path, dest_groups: pathlib.Path, id_to_name: dict,
+                 exclusions: list | None = None) -> None:
     profile = json.loads((group_dir / "profile.json").read_text(encoding="utf-8"))
     group = json.loads((group_dir / "group.json").read_text(encoding="utf-8"))
     name = profile.get("name") or group_dir.name
@@ -173,34 +191,33 @@ def export_group(group_dir: pathlib.Path, dest_groups: pathlib.Path, id_to_name:
 
 {profile.get("description") or "(no additional description)"}
 """)
-    mem = group_dir / "memory"
-    if mem.exists():
-        for p in mem.rglob("*"):
-            copy_if(p, folder / "memory" / p.relative_to(mem))
+    _copy_tree(group_dir / "memory", folder / "memory", exclusions, label="group-memory")
     write(folder / "README.md", f"""# Group: {name}
 
 Human-readable group package. See group-profile.md for members and conversations/ for group chat (if available).
 """)
 
 
-def export_shared(dest_shared: pathlib.Path) -> dict:
+def export_shared(dest_shared: pathlib.Path, exclusions: list | None = None) -> dict:
     """Copy shared data, including the workspace without recursive export paths."""
     dest_shared.mkdir(parents=True, exist_ok=True)
     project_root = AGENT_DATA / "projects"
-    if project_root.is_dir():
-        for project in project_root.iterdir():
-            if project.is_dir():
-                shutil.copytree(project, dest_shared / "projects" / project.name,
-                                symlinks=True, dirs_exist_ok=True)
+    if project_root.is_dir() and not project_root.is_symlink():
+        report = copy_tree(project_root, dest_shared / "projects", label="agent-data/projects")
+        if exclusions is not None:
+            exclusions.append(report)
     for src_name, dst_name in [("user-memory", "shared-agent-memory"),
                                ("workflows", "skills-and-workflows")]:
         src = AGENT_DATA / src_name
-        if src.is_dir():
-            shutil.copytree(src, dest_shared / dst_name,
-                            symlinks=True, dirs_exist_ok=True)
+        if src.is_dir() and not src.is_symlink():
+            report = copy_tree(src, dest_shared / dst_name, label=f"agent-data/{src_name}")
+            if exclusions is not None:
+                exclusions.append(report)
 
     # Same safe copier as raw export: never recursively copy export directories.
     report = copy_workspace(WORKSPACE, dest_shared / "workspace-outputs", OUT_ROOT)
+    if exclusions is not None:
+        exclusions.append(report)
     write(dest_shared / "README.md", """# Shared area
 
 | Folder | Description |
@@ -216,7 +233,8 @@ def export_shared(dest_shared: pathlib.Path) -> dict:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Export Virtual Office readable pack")
     add_deprecated_private_args(parser)
-    parser.add_argument("--exclude", action="append", default=[], help="Workspace path to omit")
+    parser.add_argument("--exclude", action="append", default=[],
+                        help="Path to omit under every source root (workspace and AGENT_DATA)")
     args = parser.parse_args()
     warn_deprecated_private_args(args)
     if args.exclude:
@@ -224,7 +242,9 @@ def main() -> None:
         os.environ["BACKUP_EXCLUDE_PATHS"] = os.pathsep.join(x for x in [old, *args.exclude] if x)
 
     os.umask(0o077)
-    print("WARNING: Unencrypted full-data backup; secrets, credentials, and private files may be included.", flush=True)
+    print("WARNING: Unencrypted backup. Credential files, auth databases, and opaque archives "
+          "are excluded by filename rules. Ordinary notes, settings, memory, and conversations "
+          "can still contain secrets. File contents are not printed.", flush=True)
     print(f"WORKSPACE={WORKSPACE}; OUT_ROOT={OUT_ROOT}; BACKUP_EXCLUDE_PATHS={os.environ.get('BACKUP_EXCLUDE_PATHS', '')}", flush=True)
     OUT_ROOT.mkdir(parents=True, exist_ok=True)
     if DEST.exists():
@@ -233,25 +253,26 @@ def main() -> None:
 
     id_to_name: dict[str, str] = {}
     records: list[dict] = []
+    exclusions: list[dict] = []
     agents_root = AGENT_DATA / "agents"
     dest_agents, dest_groups, dest_shared = DEST / "01-assistants", DEST / "02-groups", DEST / "00-shared"
 
     group_count = 0
     for d in sorted(agents_root.iterdir()):
         if d.is_dir() and valid_agent_id(d.name) and (d / "profile.json").exists() and not (d / "group.json").exists():
-            record = export_agent(d, dest_agents, id_to_name)
+            record = export_agent(d, dest_agents, id_to_name, exclusions)
             if record:
                 records.append(record)
     for d in sorted(agents_root.iterdir()):
         if d.is_dir() and valid_agent_id(d.name) and (d / "group.json").exists():
-            export_group(d, dest_groups, id_to_name)
+            export_group(d, dest_groups, id_to_name, exclusions)
             group_count += 1
     if group_count == 0:
         write(dest_groups / "README.md", f"""# Groups
 
 No group chats in this export (checked `{agents_root}` for `group.json`).
 """)
-    workspace_report = export_shared(dest_shared)
+    workspace_report = export_shared(dest_shared, exclusions)
     write(DEST / 'workspace-copy.json', json.dumps(workspace_report, ensure_ascii=False, indent=2))
     mem_status = apply_memory_drop(DEST, id_to_name)
 
@@ -276,6 +297,12 @@ No group chats in this export (checked `{agents_root}` for `group.json`).
     write_reports(DEST, assemble_rows(records, conv_stats, mem_status, DEST))
     # ---- copy of this program (repo at HEAD + commit hash)
     prog = snapshot_program(DEST / "99-backup-program")
+    exclusions.append({
+        "label": "backup-program/source",
+        "source": str(DEST / "99-backup-program" / "source"),
+        "excluded": prog.get("source_excluded") or [],
+    })
+    write_json(DEST / "exclusion-report.json", combine_reports(exclusions))
 
     roster = ["# Roster"] + [f"- {n} (`{i}`)" for i, n in sorted(id_to_name.items(), key=lambda x: x[1])]
     write(DEST / "roster.md", "\n".join(roster))
@@ -286,7 +313,7 @@ No group chats in this export (checked `{agents_root}` for `group.json`).
 - Export time (UTC): `{STAMP}`
 - Purpose: readable by people and portable to another virtual office; not an internal Grok Bot restore image
 - The readable package is not byte-for-byte equivalent to the original data; inspect grok-bot-export for raw state.
-- Full backup: all available notes, attachments and conversations are included (no private-content filtering).
+- Credential files, authentication databases, and opaque nested archives are excluded by default. See exclusion-report.json. Filename rules do not detect secrets written in ordinary prose. missing=0 is not full platform availability.
 - Conversations: {len([s for s in conv_stats if s['messages']])} assistants/groups, totaling {total_msgs} messages (platform-synced search-index.db; check source coverage)
 - Backup program version: commit `{prog.get('commit')}` (full source in 99-backup-program/source/)
 
