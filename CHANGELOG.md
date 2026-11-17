@@ -1,5 +1,25 @@
 # Changelog
 
+## Content scan — 2026-11-17
+
+- Redact exact secret keys in JSON settings, profiles, and config, including nested `api_key`, `access_token`, `authorization`, `password`, and `private_key`. Keep `max_tokens` and ordinary technical wording.
+- Redact high-confidence text assignments, bearer headers, and PEM private-key blocks in notes, memory, conversations, and source. Do not print the removed values.
+- Omit generic databases, binary attachments, oversize files, and unrecognized encodings from the archive. Record them as unscannable. Do not copy `store.db` or the raw search-index snapshot.
+- Preserve memory `date`, `tier`, `scope`, `source`, and file mtime, and mark each scanned record `inspected` or `redacted`.
+- Copy `$AGENT_DATA/handover` into raw `handover/` and Virtual Office `00-shared/handover/`. A missing handover is an explicit gap, not a complete export.
+- `MEMORY_MAX_AGE_DAYS` remains 2. `verify --strict` still fails when a memory drop is missing.
+
+
+## Credential exclusions — 2026-11-17
+
+- Exclude env files, private keys, cookie and session stores, token-store filenames, and credential directories by exact name on every source root: agent data, workspace, shared projects, workflows, transcripts, Virtual Office conversion, and the embedded program snapshot.
+- Exclude opaque nested archives and filename-matched authentication databases unless `INCLUDE_OPAQUE_ARCHIVES=1` or `INCLUDE_AUTH_DATABASES=1`. Those opt-ins copy the bytes and do not inspect them.
+- Apply `BACKUP_EXCLUDE_PATHS` and `--exclude` under every source root, matching path components rather than substrings. `token_parser.py` and `session-notes.md` stay.
+- Omit symlinks that leave the source tree or point at an excluded path. Do not follow them.
+- Record paths and reasons in `exclusion-report.json`. Do not write file contents into logs, manifests, or that report.
+- State that `missing=0` is not full platform availability. `MEMORY_MAX_AGE_DAYS` still defaults to 2, and `--strict` still fails when a memory drop is missing.
+
+
 ## Coverage matrix — 2026-11-01
 
 - Add `coverage.json` and `coverage.md` for each assistant across instructions, memory, routines, conversation, tool calls, private files, attachments, and connectors. Cells are `ok`, `partial`, `unavailable`, or `missing`.

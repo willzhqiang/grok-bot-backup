@@ -1,7 +1,8 @@
 """Shared paths and helpers.
 
-No private-content filtering: all accessible source files are eligible for backup.
-The old --include-private / --passphrase flags are accepted and ignored.
+Credential files, authentication databases, and opaque archives are excluded by
+default (see grok_bot_backup.sensitive). The old --include-private / --passphrase
+flags are accepted and ignored; they do not turn those exclusions off.
 """
 from __future__ import annotations
 
@@ -43,7 +44,9 @@ def fmt_taipei(ts_ms: int | None, with_seconds: bool = True) -> str:
 
 # --------------------------------------------------------------------------- deprecated flags
 DEPRECATION_NOTICE = ("NOTICE: --include-private/--passphrase are deprecated and ignored; "
-                      "private-content filtering is disabled.")
+                      "credential filename rules still apply. "
+                      "Set INCLUDE_CREDENTIAL_FILES=1, INCLUDE_AUTH_DATABASES=1, or "
+                      "INCLUDE_OPAQUE_ARCHIVES=1 only when you intend to copy those files.")
 
 
 def add_deprecated_private_args(parser: argparse.ArgumentParser) -> None:
@@ -71,9 +74,17 @@ def write(path: pathlib.Path, text: str) -> None:
 
 
 def copy_if(src: pathlib.Path, dst: pathlib.Path) -> None:
-    if src.exists() and src.is_file():
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(src, dst)
+    """Copy a regular file. Symlinks are not followed. Excluded or unscannable files are skipped."""
+    from .sanitize import transfer_regular_file
+    from .sensitive import exclusion_reason
+
+    src = pathlib.Path(src)
+    if src.is_symlink() or not src.is_file():
+        return
+    names = tuple(part for part in src.parts if part not in (os.sep, "/", ""))
+    if names and exclusion_reason(names, is_dir=False):
+        return
+    transfer_regular_file(src, dst)
 
 
 def lock_down(root: pathlib.Path) -> None:

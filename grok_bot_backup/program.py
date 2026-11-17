@@ -9,6 +9,7 @@ import tarfile
 from datetime import datetime, timezone
 
 from .common import REPO_ROOT, write
+from .sensitive import scrub_tree, write_json
 
 
 def _git(*args: str) -> str:
@@ -41,6 +42,13 @@ def snapshot_program(dest: pathlib.Path) -> dict:
         with tarfile.open(fileobj=io.BytesIO(data)) as tar:
             tar.extractall(dest / "source", filter="data")
         (dest / "COMMIT").write_text(info["commit"] + "\n", encoding="utf-8")
+    removed = scrub_tree(dest / "source") if (dest / "source").is_dir() else []
+    info["source_excluded"] = removed
+    write_json(dest / "source-exclusions.json", {
+        "label": "backup-program/source",
+        "source": str(dest / "source"),
+        "excluded": removed,
+    })
     dirty_note = ""
     if info.get("dirty"):
         dirty_note = (

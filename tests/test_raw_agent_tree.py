@@ -34,15 +34,17 @@ class RawAgentTreeTests(unittest.TestCase):
             (agents / AGENT_ID / "notes" / "memo.md").write_text("original note")
             source_files = {
                 "organization/profile.json": "{}",
-                "organization/store.db": "organization raw database",
                 "people/profile.json": "{}",
-                "people/store.db": "people raw database",
                 "procedures/profile.json": "{}",
-                "procedures/store.db": "procedures raw database",
                 "active-agent.json": '{"active":true}',
                 "audit-outbox.json": '{"queued":[]}',
             }
-            for name, data_text in source_files.items():
+            omitted_databases = {
+                "organization/store.db": "organization raw database",
+                "people/store.db": "people raw database",
+                "procedures/store.db": "procedures raw database",
+            }
+            for name, data_text in {**source_files, **omitted_databases}.items():
                 p = agents / name
                 p.parent.mkdir(parents=True, exist_ok=True)
                 p.write_text(data_text)
@@ -104,6 +106,11 @@ class RawAgentTreeTests(unittest.TestCase):
             for name, expected in source_files.items():
                 with self.subTest(name=name):
                     self.assertEqual((folder / "agents" / name).read_text(), expected)
+            for name in omitted_databases:
+                with self.subTest(omitted=name):
+                    self.assertFalse((folder / "agents" / name).exists())
+            self.assertIn("not supplied", (folder / "handover" / "HANDOVER_STATUS.md").read_text(encoding="utf-8"))
+            self.assertIn("not a complete handover", (folder / "handover" / "HANDOVER_STATUS.md").read_text(encoding="utf-8"))
             self.assertEqual(
                 (folder / "agents" / AGENT_ID / "private" / "note.txt").read_text(),
                 "private original content",
@@ -116,12 +123,16 @@ class RawAgentTreeTests(unittest.TestCase):
             )
             self.assertEqual([p["agent_id"] for p in stats["agents"]], [AGENT_ID])
             self.assertEqual(stats["agents"][0]["messages"], 1)
-            snapshot = folder / "conversations" / "search-index-snapshot.db"
-            self.assertTrue(snapshot.is_file())
-            with sqlite3.connect(snapshot) as copied:
-                self.assertEqual(
-                    copied.execute("select count(*) from messages").fetchone()[0], 2
-                )
+            self.assertFalse((folder / "conversations" / "search-index-snapshot.db").exists())
+            omitted = json.loads(
+                (folder / "conversations" / "search-index-snapshot-omitted.json").read_text(encoding="utf-8")
+            )
+            self.assertFalse(omitted["included"])
+            self.assertEqual(omitted["reason"], "unscannable database")
+            self.assertIn("Hello", "\n".join(
+                path.read_text(encoding="utf-8")
+                for path in (folder / "conversations").rglob("*.md") if path.is_file()
+            ))
 
             verified = subprocess.run(
                 [str(repo / "bin" / "verify-export.sh"), str(folder),

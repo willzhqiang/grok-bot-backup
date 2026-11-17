@@ -19,6 +19,10 @@ import hashlib
 
 from .common import AGENT_DATA, SEARCH_INDEX, TAIPEI
 from .coverage import report_coverage
+from .sanitize import export_bytes
+from .sensitive import exclusion_reason
+
+DEFAULT_MEMORY_MAX_AGE_DAYS = 2
 
 ENTRY_RE = re.compile(r"^<!-- entry:(\S+) seq:(\S+) -->$", re.M)
 HDR_RE = re.compile(r"^### (\d{4}-\d{2}-\d{2}) \d{2}:\d{2}:\d{2} · ", re.M)
@@ -44,7 +48,7 @@ def main() -> None:
     a = ap.parse_args()
     root = pathlib.Path(a.export_dir)
     ok = True
-    max_age_days = float(os.environ.get("MEMORY_MAX_AGE_DAYS", "2"))
+    max_age_days = float(os.environ.get("MEMORY_MAX_AGE_DAYS", str(DEFAULT_MEMORY_MAX_AGE_DAYS)))
     if max_age_days < 0:
         raise SystemExit("MEMORY_MAX_AGE_DAYS cannot be negative")
 
@@ -120,12 +124,42 @@ def main() -> None:
         except (OSError, ValueError, zipfile.BadZipFile, tarfile.TarError, RuntimeError) as exc:
             check(False, f"cannot read archive: {exc}")
 
-    # full backup: every source notes/ file must have a byte-identical copy in the export
+    # Notes must match the sanitized bytes that the exporter writes. Unscannable
+    # notes are omitted on purpose and are not required to appear.
     def sha(p: pathlib.Path) -> str:
         return hashlib.sha256(p.read_bytes()).hexdigest()
-    exported = {sha(p) for p in root.rglob("*") if p.is_file() and p.stat().st_size}
-    src = [p for p in (AGENT_DATA / "agents").glob("*/notes/**/*") if p.is_file() and p.stat().st_size]
-    missing = [p for p in src if sha(p) not in exported]
+
+    def scanned_sha(path: pathlib.Path):
+        payload = export_bytes(path)
+        if payload is None:
+            return None
+        return hashlib.sha256(payload).hexdigest()
+
+    exported = set()
+    for path in root.rglob("*"):
+        if path.is_symlink() or not path.is_file():
+            continue
+        if path.stat().st_size:
+            exported.add(sha(path))
+
+    def _note_excluded(path: pathlib.Path) -> bool:
+        if path.is_symlink():
+            return True
+        try:
+            relative = path.relative_to(AGENT_DATA / "agents")
+        except ValueError:
+            return True
+        return exclusion_reason(relative.parts, is_dir=False) is not None
+
+    src = [p for p in (AGENT_DATA / "agents").glob("*/notes/**/*")
+           if p.is_file() and not _note_excluded(p) and p.stat().st_size]
+    missing = []
+    for path in src:
+        digest = scanned_sha(path)
+        if digest is None:
+            continue
+        if digest not in exported:
+            missing.append(path)
     check(not missing, f"all notes files included ({len(src) - len(missing)}/{len(src)})")
     for p in missing[:20]:
         print(f"     missing: {p.relative_to(AGENT_DATA)}")
@@ -278,11 +312,12 @@ def main() -> None:
     # still available. Do not use current source mtimes to assess backup age.
     drop = pathlib.Path(os.environ.get(
         "MEMORY_DROP", str(pathlib.Path(os.environ.get("WORKSPACE", "/workspace")) / "exports" / "memory-drop")))
-    exported_sha = {sha(p) for p in root.rglob("*.jsonl") if p.is_file()}
-    exported_status_sha = {sha(p) for p in root.rglob("memory-status.json") if p.is_file()}
+    exported_sha = {sha(p) for p in root.rglob("*.jsonl") if p.is_file() and not p.is_symlink()}
+    exported_status_sha = {sha(p) for p in root.rglob("memory-status.json") if p.is_file() and not p.is_symlink()}
     shared = drop / "shared-user" / "memory-user.jsonl"
     if shared.is_file():
-        check(sha(shared) in exported_sha, "shared memory-user.jsonl copied into export")
+        digest = scanned_sha(shared)
+        check(digest is not None and digest in exported_sha, "shared memory-user.jsonl copied into export")
     shared_status = drop / "shared-user" / "memory-status.json"
     if shared_status.is_file():
         check(sha(shared_status) in exported_status_sha,
@@ -291,8 +326,13 @@ def main() -> None:
         for agent_dir in (drop / "agents").iterdir():
             if not agent_dir.is_dir():
                 continue
-            missing = [p.name for p in agent_dir.glob("*.jsonl")
-                       if p.is_file() and sha(p) not in exported_sha]
+            missing = []
+            for path in agent_dir.glob("*.jsonl"):
+                if not path.is_file() or path.is_symlink():
+                    continue
+                digest = scanned_sha(path)
+                if digest is None or digest not in exported_sha:
+                    missing.append(path.name)
             check(not missing, f"memory drop copied for {agent_dir.name}"
                   + ("" if not missing else " missing " + ",".join(missing)))
             status_file = agent_dir / "memory-status.json"

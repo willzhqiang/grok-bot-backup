@@ -177,8 +177,21 @@ def _display_folder(agent_id: str, id_to_name: dict[str, str] | None) -> tuple[s
 
 
 def _copy_jsonl(src: pathlib.Path, dst: pathlib.Path) -> None:
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(src, dst)
+    """Copy a regular JSONL or JSON file without following symlinks.
+
+    Text is scanned. Provenance fields stay. File mtime is preserved.
+    Unscannable files are left out. Secret values are not logged.
+    """
+    if src.is_symlink() or not src.is_file():
+        return
+    from .sensitive import exclusion_reason
+    from .sanitize import transfer_regular_file, unscannable_reason
+    names = tuple(part for part in src.parts if part not in (os.sep, "/", ""))
+    if names and exclusion_reason(names, is_dir=False):
+        return
+    if unscannable_reason(src):
+        return
+    transfer_regular_file(src, dst)
 
 
 def _drop_record(agent_id: str, label: str, required: bool, directory: pathlib.Path) -> dict:
@@ -387,12 +400,23 @@ def _write_agent(dest, agent_id, label, drop_dir, id_to_name, dropped: bool) -> 
     rows: list[dict] = []
     for src in files:
         _copy_jsonl(src, mem / src.name)
-        rows.extend(load_jsonl(src))
+        copied = mem / src.name
+        if copied.is_file():
+            rows.extend(load_jsonl(copied))
+    redacted = any(row.get("sanitization") == "redacted" for row in rows)
+    intro = (
+        "Exported by this assistant using RecallMemory. Persistent = profile tier; assistant-owned = log/note tiers. "
+        "date, tier, scope, and source are preserved. "
+    )
+    if redacted:
+        intro += "High-confidence credential values inside fact text were redacted and marked sanitization=redacted. "
+    else:
+        intro += "Fact text was inspected. Records are marked sanitization=inspected when they were scanned. "
+    intro += "This is not a claim that the memory text is secret-free."
     write(mem / "platform-memory.md", render_markdown(
         rows,
         f"Platform memory · {label}",
-        "Exported by this assistant using RecallMemory. Persistent = profile tier; assistant-owned = log/note tiers."
-        " Each record includes a date and full content; JSONL preserves the original entries.",
+        intro,
     ))
 
 

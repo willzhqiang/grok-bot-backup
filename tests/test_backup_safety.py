@@ -33,7 +33,12 @@ class BackupSafetyTests(unittest.TestCase):
                     report = virtual_office.export_shared(output / "virtual-office" / "00-shared")
 
             exported = output / "virtual-office" / "00-shared" / "workspace-outputs"
-            self.assertTrue((exported / "secrets" / "credential.txt").is_file())
+            self.assertFalse((exported / "secrets" / "credential.txt").exists())
+            self.assertNotIn("sensitive", "\n".join(
+                path.read_text(encoding="utf-8", errors="replace")
+                for path in exported.rglob("*") if path.is_file() and not path.is_symlink()
+            ))
+            self.assertTrue(any("credential location" in item for item in report["skipped"]))
             self.assertTrue((exported / "docs" / "note.md").is_file())
             self.assertFalse((exported / "exports").exists())
             self.assertFalse((exported / "custom" / "archives").exists())
