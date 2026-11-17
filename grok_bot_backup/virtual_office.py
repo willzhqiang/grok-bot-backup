@@ -24,6 +24,7 @@ from .common import (
 )
 from .archive import create_zip
 from .program import snapshot_program
+from .handover import append_coverage, install_handover
 from .sensitive import (
     combine_reports, copy_tree, exclusion_reason, filtered_presence, redact_exact_secret_keys,
     write_json,
@@ -70,7 +71,8 @@ def export_agent(agent_dir: pathlib.Path, dest_agents: pathlib.Path, id_to_name:
     folder = dest_agents / safe_name(name)
     folder.mkdir(parents=True, exist_ok=True)
 
-    desc = profile.get("description") or ""
+    from .sanitize import redact_text
+    desc, _count = redact_text(profile.get("description") or "")
     title = profile.get("title") or ""
     settings = {}
     sp = agent_dir / "settings.json"
@@ -295,6 +297,9 @@ No group chats in this export (checked `{agents_root}` for `group.json`).
         if stat.get("kind") == "agent" and stat.get("toolcalls") == "unavailable":
             print(f"WARN tool calls unavailable: {stat['name']}", flush=True)
     write_reports(DEST, assemble_rows(records, conv_stats, mem_status, DEST))
+    handover_report = install_handover(dest_shared / "handover", label="virtual-office-handover")
+    exclusions.append(handover_report)
+    append_coverage(DEST / "coverage.md", handover_report.get("handover_status") == "supplied")
     # ---- copy of this program (repo at HEAD + commit hash)
     prog = snapshot_program(DEST / "99-backup-program")
     exclusions.append({

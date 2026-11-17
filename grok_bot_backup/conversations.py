@@ -133,7 +133,7 @@ def render_month(info, month, rows, media_by_entry) -> str:
         "",
         f"- Time zone: Asia/Taipei (UTC+8)",
         f"- Messages this month: {len(rows)} ({USER_LABEL}: {users}; assistant: {len(rows) - users})",
-        f"- Source: platform-synced search-index.db; message bodies are preserved verbatim",
+        "- Source: platform-synced search-index.db; high-confidence credential assignments are redacted and ordinary wording is kept",
         "",
     ]
     cur_day = None
@@ -147,7 +147,9 @@ def render_month(info, month, rows, media_by_entry) -> str:
         out.append(f"<!-- entry:{eid} seq:{seq} -->")
         out.append(f"### {fmt_taipei(ts)} · {speaker(role, info)}")
         out.append("")
-        out.append(body if body is not None else "")
+        from .sanitize import redact_text
+        spoken, _count = redact_text(body if isinstance(body, str) else "")
+        out.append(spoken)
         att = media_by_entry.get(eid)
         if att:
             out.append("")
@@ -165,7 +167,7 @@ def render_frozen_transcript(jsonl: pathlib.Path, info, result_limit: int = 2000
         f"- Source: {source}",
         "- Raw rows: `raw/transcript.jsonl`",
         "- Timestamps are included only when the source row has them",
-        f"- Tool results longer than {result_limit} characters are truncated; raw JSONL is unchanged",
+        f"- Tool results longer than {result_limit} characters are truncated. High-confidence secrets are redacted. The raw SQLite database is not copied.",
         "",
     ]
     with jsonl.open(encoding="utf-8", errors="replace") as f:
@@ -220,10 +222,12 @@ def _parse_transcript_jsonl(path: pathlib.Path) -> list[dict]:
 
 
 def _write_transcript_jsonl(path: pathlib.Path, rows: list[dict]) -> None:
+    from .sanitize import redact_structured
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as handle:
         for row in rows:
-            handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+            clean, _stats = redact_structured(row)
+            handle.write(json.dumps(clean, ensure_ascii=False) + "\n")
 
 
 def first_user_message(agent_id: str, index_path: pathlib.Path | None = None) -> str | None:
@@ -244,7 +248,9 @@ def first_user_message(agent_id: str, index_path: pathlib.Path | None = None) ->
         return None
     if not row or not isinstance(row[0], str) or not row[0].strip():
         return None
-    return row[0]
+    from .sanitize import redact_text
+    spoken, _count = redact_text(row[0])
+    return spoken
 
 
 def export_tool_transcript(info: dict, conv_dir: pathlib.Path) -> tuple[str, str]:
@@ -255,7 +261,8 @@ def export_tool_transcript(info: dict, conv_dir: pathlib.Path) -> tuple[str, str
     raw = conv_dir / "raw" / "transcript.jsonl"
     if file_rows:
         raw.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(jsonl_path, raw)
+        from .sanitize import transfer_regular_file
+        transfer_regular_file(jsonl_path, raw)
         source = "agent-transcripts/<id>/<id>.jsonl"
         if db_rows:
             source += "; store.db transcript_entries also present (jsonl used)"
@@ -288,12 +295,14 @@ def export_agent_conversation(db, info, conv_dir: pathlib.Path, attach_link: Cal
         write(conv_dir / f"{month}.md", render_month(info, month, mrows, media_by_entry))
 
     # raw machine-readable copies
+    from .sanitize import redact_text
     raw = conv_dir / "raw"
     raw.mkdir(exist_ok=True)
     with (raw / "messages.jsonl").open("w", encoding="utf-8") as f:
         for seq, eid, role, ts, body in rows:
+            spoken, _count = redact_text(body if isinstance(body, str) else "")
             f.write(json.dumps({"seq": seq, "entry_id": eid, "role": role, "timestamp_ms": ts,
-                                "time_taipei": fmt_taipei(ts), "body": body}, ensure_ascii=False) + "\n")
+                                "time_taipei": fmt_taipei(ts), "body": spoken}, ensure_ascii=False) + "\n")
     with (raw / "media.jsonl").open("w", encoding="utf-8") as f:
         for m in media:
             f.write(json.dumps(m, ensure_ascii=False) + "\n")
@@ -411,11 +420,20 @@ def export_all(layout: Callable[[dict], pathlib.Path], attach_link_for: Callable
                index_snapshot_path: pathlib.Path | None = None) -> list[dict]:
     db, cutoff = open_index_snapshot()
     if index_snapshot_path is not None:
-        # Preserve every indexed record, including non-assistant platform rows,
-        # without misclassifying those rows as assistant conversations.
+        # The raw SQLite file is an unscannable database, so it stays out of the
+        # archive. Conversation text is written as Markdown after redaction.
         index_snapshot_path.parent.mkdir(parents=True, exist_ok=True)
-        with sqlite3.connect(index_snapshot_path) as copy:
-            db.backup(copy)
+        note = index_snapshot_path.with_name("search-index-snapshot-omitted.json")
+        note.write_text(json.dumps({
+            "included": False,
+            "reason": "unscannable database",
+            "detail": (
+                "The raw search-index snapshot is not in this archive. "
+                "Assistant conversation text is in the Markdown files after "
+                "high-confidence redaction. Verification still uses the live index "
+                "when that file is available. This is not a secret-free claim."
+            ),
+        }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     reg = agent_registry()
     ids = sorted(set(index_agent_ids(db)) | set(reg))
     stats, links = [], {}

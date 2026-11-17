@@ -1,5 +1,15 @@
 # Changelog
 
+## Content scan — 2026-11-17
+
+- Redact exact secret keys in JSON settings, profiles, and config, including nested `api_key`, `access_token`, `authorization`, `password`, and `private_key`. Keep `max_tokens` and ordinary technical wording.
+- Redact high-confidence text assignments, bearer headers, and PEM private-key blocks in notes, memory, conversations, and source. Do not print the removed values.
+- Omit generic databases, binary attachments, oversize files, and unrecognized encodings from the archive. Record them as unscannable. Do not copy `store.db` or the raw search-index snapshot.
+- Preserve memory `date`, `tier`, `scope`, `source`, and file mtime, and mark each scanned record `inspected` or `redacted`.
+- Copy `$AGENT_DATA/handover` into raw `handover/` and Virtual Office `00-shared/handover/`. A missing handover is an explicit gap, not a complete export.
+- `MEMORY_MAX_AGE_DAYS` remains 2. `verify --strict` still fails when a memory drop is missing.
+
+
 ## Credential exclusions — 2026-11-17
 
 - Exclude env files, private keys, cookie and session stores, token-store filenames, and credential directories by exact name on every source root: agent data, workspace, shared projects, workflows, transcripts, Virtual Office conversion, and the embedded program snapshot.

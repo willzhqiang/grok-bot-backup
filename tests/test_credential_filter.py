@@ -6,6 +6,7 @@ import io
 import json
 import os
 from pathlib import Path
+import time
 import sqlite3
 import subprocess
 import sys
@@ -261,6 +262,18 @@ class ExportFilterTests(unittest.TestCase):
             "skip": f"SYNTHETIC_SECRET_SKIP_{token}",
             "session": f"SYNTHETIC_SECRET_SESSION_{token}",
             "sub": f"SYNTHETIC_SECRET_SUB_{token}",
+            "api": f"SYNTHETIC_SECRET_API_{token}",
+            "access": f"SYNTHETIC_SECRET_ACCESS_{token}",
+            "authz": f"SYNTHETIC_SECRET_AUTHZ_{token}",
+            "password": f"SYNTHETIC_SECRET_PASSWORD_{token}",
+            "pkey": f"SYNTHETIC_SECRET_PKEY_{token}",
+            "db": f"SYNTHETIC_SECRET_DB_{token}",
+            "binary": f"SYNTHETIC_SECRET_BINARY_{token}",
+            "assign": f"SYNTHETIC_SECRET_ASSIGN_{token}",
+            "bearer": f"SYNTHETIC_SECRET_BEARER_{token}",
+            "pem": f"SYNTHETIC_SECRET_PEM_{token}",
+            "memory": f"SYNTHETIC_SECRET_MEMORY_{token}",
+            "handover": f"SYNTHETIC_SECRET_HANDOVER_{token}",
         }
         data = root / "agent-data"
         agent = data / "agents" / AGENT_ID
@@ -273,7 +286,16 @@ class ExportFilterTests(unittest.TestCase):
         (agent / "private" / "note.txt").write_text(SAFE_NOTE, encoding="utf-8")
         (agent / "notes").mkdir()
         (agent / "notes" / "token-handling.md").write_text(
-            "Ordinary note about the token parser.\n", encoding="utf-8")
+            "Ordinary note about the token parser.\n"
+            "max_tokens = 128\n"
+            f"API_KEY={secrets['assign']}\n"
+            f"Authorization: Bearer {secrets['bearer']}\n"
+            "Choose a strong password policy.\n"
+            "-----BEGIN PRIVATE KEY-----\n"
+            f"{secrets['pem']}\n"
+            "-----END PRIVATE KEY-----\n",
+            encoding="utf-8",
+        )
         (agent / "sessions").mkdir()
         (agent / "sessions" / "sessionstore.json").write_text(secrets["session"], encoding="utf-8")
         (agent / "custom-skip").mkdir()
@@ -291,7 +313,17 @@ class ExportFilterTests(unittest.TestCase):
         (agent / "settings.json").write_text(json.dumps({
             "theme": "dawn",
             "max_tokens": 128,
+            "auth": {
+                "api_key": secrets["api"],
+                "access_token": secrets["access"],
+                "authorization": secrets["authz"],
+                "password": secrets["password"],
+                "private_key": secrets["pkey"],
+            },
         }), encoding="utf-8")
+        (agent / "store.db").write_bytes(secrets["db"].encode())
+        (agent / "attachments").mkdir()
+        (agent / "attachments" / "blob.bin").write_bytes(b"\x00" + secrets["binary"].encode())
         (agent / "standing-rules.md").write_text("Keep ordinary handover notes.\n", encoding="utf-8")
         outside = root / "outside-secret.txt"
         outside.write_text(secrets["link"], encoding="utf-8")
@@ -301,6 +333,15 @@ class ExportFilterTests(unittest.TestCase):
         (data / "agents" / "organization").mkdir(parents=True)
         (data / "agents" / "organization" / "store.db").write_text(SAFE_ORG, encoding="utf-8")
         (data / "agents" / "active-agent.json").write_text('{"active":true}', encoding="utf-8")
+        handover = data / "handover"
+        handover.mkdir()
+        (handover / "self-report.md").write_text(
+            "Handover for the token parser.\n"
+            f"API_KEY={secrets['handover']}\n"
+            "max_tokens = 128\n"
+            "Choose a strong password policy.\n",
+            encoding="utf-8",
+        )
         (data / "projects" / "demo").mkdir(parents=True)
         (data / "projects" / "demo" / "readme.md").write_text("project readme\n", encoding="utf-8")
         (data / "projects" / "demo" / ".env").write_text(secrets["project"], encoding="utf-8")
@@ -349,12 +390,13 @@ class ExportFilterTests(unittest.TestCase):
 
         drop = root / "memory-drop" / "agents" / AGENT_ID
         drop.mkdir(parents=True)
-        (drop / "memory-agent.jsonl").write_text(json.dumps({
+        memory_file = drop / "memory-agent.jsonl"
+        memory_file.write_text(json.dumps({
             "date": "2026-10-22",
             "tier": "note",
             "scope": "agent",
             "source": "RecallMemory",
-            "fact": SAFE_MEMORY,
+            "fact": f"{SAFE_MEMORY} API_KEY={secrets['memory']}",
         }) + "\n", encoding="utf-8")
         return secrets
 
@@ -392,6 +434,9 @@ class ExportFilterTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             secrets = self._build(root)
+            memory_source = root / "memory-drop" / "agents" / AGENT_ID / "memory-agent.jsonl"
+            memory_stamp = int(time.time()) - 3600
+            os.utime(memory_source, (memory_stamp, memory_stamp))
             output = root / "workspace" / "exports"
             env = os.environ.copy()
             env.update({
@@ -423,7 +468,33 @@ class ExportFilterTests(unittest.TestCase):
             settings = json.loads((folder / "agents" / AGENT_ID / "settings.json").read_text(encoding="utf-8"))
             self.assertEqual(settings["theme"], "dawn")
             self.assertEqual(settings["max_tokens"], 128)
-            self.assertEqual((folder / "agents" / "organization" / "store.db").read_text(encoding="utf-8"), SAFE_ORG)
+            self.assertFalse((folder / "agents" / "organization" / "store.db").exists())
+            self.assertFalse((folder / "agents" / AGENT_ID / "store.db").exists())
+            self.assertFalse((folder / "agents" / AGENT_ID / "attachments" / "blob.bin").exists())
+            settings_text = (folder / "agents" / AGENT_ID / "settings.json").read_text(encoding="utf-8")
+            self.assertIn("dawn", settings_text)
+            self.assertIn("128", settings_text)
+            self.assertIn("<redacted>", settings_text)
+            note = (folder / "agents" / AGENT_ID / "notes" / "token-handling.md").read_text(encoding="utf-8")
+            self.assertIn("max_tokens = 128", note)
+            self.assertIn("Choose a strong password policy.", note)
+            self.assertIn("<redacted>", note)
+            self.assertNotIn("BEGIN PRIVATE KEY", note)
+            handover_text = (folder / "handover" / "self-report.md").read_text(encoding="utf-8")
+            self.assertIn("token parser", handover_text)
+            self.assertIn("max_tokens = 128", handover_text)
+            self.assertIn("Choose a strong password policy.", handover_text)
+            self.assertIn("supplied", (folder / "handover" / "HANDOVER_STATUS.md").read_text(encoding="utf-8"))
+            self.assertIn("Status: supplied", (folder / "coverage.md").read_text(encoding="utf-8"))
+            memory = (folder / "agents" / AGENT_ID / "platform-memory" / "memory-agent.jsonl").read_text(encoding="utf-8")
+            self.assertIn(SAFE_MEMORY, memory)
+            self.assertIn("2026-10-22", memory)
+            self.assertIn("RecallMemory", memory)
+            self.assertIn("sanitization", memory)
+            self.assertEqual(
+                int((folder / "agents" / AGENT_ID / "platform-memory" / "memory-agent.jsonl").stat().st_mtime),
+                memory_stamp,
+            )
             self.assertEqual((folder / "agents" / AGENT_ID / "custom-keep" / "plain.txt").read_text(encoding="utf-8"), SAFE_KEEP)
             conversation_text = "\n".join(
                 path.read_text(encoding="utf-8")
@@ -439,6 +510,12 @@ class ExportFilterTests(unittest.TestCase):
             self.assertIn("authentication database", reasons)
             self.assertIn("opaque archive", reasons)
             self.assertIn("configured exclusion", reasons)
+            self.assertIn("unscannable database", reasons)
+            self.assertIn("unscannable binary", reasons)
+            self.assertGreater(report.get("inspected_files") or 0, 0)
+            self.assertGreater(report.get("redacted_count") or 0, 0)
+            self.assertFalse((folder / "conversations" / "search-index-snapshot.db").exists())
+            self.assertTrue((folder / "conversations" / "search-index-snapshot-omitted.json").is_file())
             self.assertTrue(any("symlink" in reason for reason in reasons))
             self.assertIn("missing=0 is not full platform availability", "\n".join(report["limitations"]))
             manifest = (folder / "meta" / "MANIFEST.json").read_text(encoding="utf-8")
@@ -482,6 +559,15 @@ class ExportFilterTests(unittest.TestCase):
             profile = (assistant / "profile.md").read_text(encoding="utf-8")
             self.assertIn("dawn", profile)
             self.assertIn("128", profile)
+            self.assertIn("<redacted>", profile)
+            human_note = (assistant / "notes-and-profiles" / "token-handling.md").read_text(encoding="utf-8")
+            self.assertIn("max_tokens = 128", human_note)
+            self.assertIn("Choose a strong password policy.", human_note)
+            human_handover = (human / "00-shared" / "handover" / "self-report.md").read_text(encoding="utf-8")
+            self.assertIn("token parser", human_handover)
+            self.assertIn("max_tokens = 128", human_handover)
+            self.assertIn("supplied", (human / "00-shared" / "handover" / "HANDOVER_STATUS.md").read_text(encoding="utf-8"))
+            self.assertFalse((assistant / "attachments-and-work" / "blob.bin").exists())
             self.assertIn(SAFE_MEMORY, (assistant / "memory" / "memory-agent.jsonl").read_text(encoding="utf-8"))
             self.assertEqual(
                 (human / "00-shared" / "workspace-outputs" / "src" / "token_parser.py").read_text(encoding="utf-8"),

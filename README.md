@@ -73,13 +73,17 @@ Old `.tar.gz` backups remain readable by supported archive tools and can still b
 
 Both the raw export and the Virtual Office export use the same rules on **every source root**: `AGENT_DATA` (agents, private files, `backup_pre`, projects, workflows, user memory, transcripts), `WORKSPACE`, memory-drop files that match a credential name, business-data trees copied into the readable pack, and the embedded program snapshot.
 
-A path is excluded when a **path component or filename matches exactly** (case-insensitive), or when the extension is a known private-key or archive extension. Matching is not a substring search. These names stay in the backup:
+A path is excluded when a **path component or filename matches exactly** (case-insensitive), or when the extension is a known private-key or archive extension. Matching is not a substring search. Text and JSON that are kept are then scanned. Exact secret keys (`api_key`, `access_token`, `authorization`, `password`, `private_key`, and the same names with `_` or `-`) and high-confidence assignments such as `API_KEY=...`, `Authorization: Bearer ...`, and PEM private-key blocks are replaced with `<redacted>`. `max_tokens`, `sessionTimeout`, and ordinary sentences such as "Choose a strong password policy" or "the token parser" stay. Removed values are not printed.
+
+These names and fields stay in the backup:
 
 - `src/token_parser.py`, `tokenizer.py`, `design-tokens.css`
 - `session-notes.md`, `notes/token-handling.md`
-- `settings.json` keys such as `max_tokens` and `theme`
-- `profile.json`, instructions, standing rules, memory JSONL, and conversations
-- ordinary `private/note.txt` and `store.db` / `search-index.db`
+- `settings.json` fields such as `max_tokens` and `theme`
+- `profile.json`, instructions, standing rules, memory JSONL, and conversations, after that scan
+- ordinary `private/note.txt`
+
+Memory JSONL keeps `date`, `tier`, `scope`, and `source`. The file modification time is preserved. Each scanned record is marked `sanitization` `inspected` or `redacted`.
 
 These are omitted unless you opt in:
 
@@ -92,7 +96,9 @@ These are omitted unless you opt in:
 | Authentication databases | `cookies.sqlite`, `auth.db`, `Login Data`, `*.kdbx`, and their `-wal`/`-shm`/`-journal` sidecars | `INCLUDE_AUTH_DATABASES=1` |
 | Opaque nested archives | `*.zip`, `*.tar`, `*.tar.gz`, `*.tgz`, `*.7z`, `*.rar`, including `migration/box-files.tar.gz` | `INCLUDE_OPAQUE_ARCHIVES=1` |
 
-Opt-in copies those files **without opening them** and without removing secrets inside an archive. Previous `grok-bot-export-*` and `virtual-office-*` directories and archives stay excluded even when `INCLUDE_OPAQUE_ARCHIVES=1`. `store.db` and the search index are not treated as authentication databases and are not scanned for credentials.
+Opt-in copies those files **without opening them** and without removing secrets inside an archive. Previous `grok-bot-export-*` and `virtual-office-*` directories and archives stay excluded even when `INCLUDE_OPAQUE_ARCHIVES=1`.
+
+Generic databases and other unscannable bytes are **omitted with no opt-in**. That includes `store.db`, `*.sqlite`, the raw `search-index-snapshot.db`, binary attachments, files larger than `SANITIZE_MAX_BYTES` (default 1 MiB), and files that are not valid UTF-8. They are listed as `unscannable database`, `unscannable binary`, `oversize`, or `unrecognized encoding`. The archive does not contain their bytes. Conversation text still comes from the search index as Markdown after redaction. Tool-call text can still be read from `store.db` while building that Markdown; the database file itself is not packed. Coverage for a folder that only contained those files is `partial` (present on disk, omitted from the archive), not a silent `ok`. `missing` is still the cell that fails `verify --strict`. `unavailable` still means the probe did not find the category on disk. **`missing=0` is not full platform availability**, and a clean scan is not a secret-free claim.
 
 Symlinks that point outside the source tree, or at an excluded path, are dropped and never followed. In-tree links to ordinary files are stored as links. The ZIP writer also stores links as links and refuses archive names that are absolute or contain `..`.
 
@@ -114,9 +120,9 @@ BACKUP_EXCLUDE_PATHS="custom-skip:old-archives:/mnt/other-data" bin/export-grok-
 INCLUDE_CREDENTIAL_FILES=1 INCLUDE_AUTH_DATABASES=1 INCLUDE_OPAQUE_ARCHIVES=1 bin/export-grok-bot-backup.sh
 ```
 
-Each skip is a path plus a reason. The raw export writes `meta/exclusion-report.json` and `meta/workspace-copy.json`. The Virtual Office export writes `exclusion-report.json` and `workspace-copy.json`. Reports do not contain file contents. Logs do not print secret values.
+Each skip is a path plus a reason. The raw export writes `meta/exclusion-report.json` and `meta/workspace-copy.json`. The Virtual Office export writes `exclusion-report.json` and `workspace-copy.json`. The report counts `inspected_files`, `redacted` paths and key names, and `omitted_unscannable` paths. It does not contain file contents. Logs do not print secret values.
 
-**These rules do not prove an archive is free of secrets.** A password written inside a note, a settings value, a memory fact, a conversation, or a source file is still copied. An unusually named database or archive is not recognized. Do not describe filename filtering as a guarantee.
+**These rules do not prove an archive is free of secrets.** A secret written as ordinary prose, inside an omitted database, or inside an opted-in archive is not removed. Do not describe the scan as a guarantee.
 
 Both commands also **always** exclude the configured `OUT_ROOT` and `$WORKSPACE/exports` (even if `OUT_ROOT` points elsewhere), plus pre-existing `grok-bot-export-*` or `virtual-office-*` directories and their archives anywhere in the copied workspace. Large build directories (`.venv*`, `.cache`, `node_modules`, `__pycache__`, `.git`) are skipped in the workspace unless `INCLUDE_BULKY_DIRS=1`. Sand-subagent transcripts are skipped unless `INCLUDE_SUBAGENTS=1`.
 
@@ -126,6 +132,37 @@ INCLUDE_BULKY_DIRS=1 bin/export-virtual-office.sh
 ```
 
 **Warning:** A finished export still cannot include information the local platform does not expose. See memory preparation below. `missing=0` is not full platform availability.
+
+## Staging export and handover
+
+`AGENT_DATA`, `WORKSPACE`, `MEMORY_DROP`, and `OUT_ROOT` are the source roots. Point them at a staging directory you built. The tools do not open any other platform root, and they do not need a live agent, X-Monitor, or the rest of a shared box. No extra switch is required.
+
+```bash
+STAGE=$(mktemp -d)
+mkdir -p "$STAGE/agent-data/agents/<uuid>" "$STAGE/agent-data/handover" \
+  "$STAGE/workspace" "$STAGE/memory-drop/agents/<uuid>" "$STAGE/out"
+# Copy only the metadata, memory JSONL, and handover you intend to export.
+# Add a minimal search-index.db if you want conversation Markdown.
+export AGENT_DATA="$STAGE/agent-data"
+export WORKSPACE="$STAGE/workspace"
+export MEMORY_DROP="$STAGE/memory-drop"
+export OUT_ROOT="$STAGE/out"
+bin/export-grok-bot-backup.sh
+bin/export-virtual-office.sh
+```
+
+Put the handover self-report in `$AGENT_DATA/handover/` **before** those commands. It is copied, after the same scan, to `handover/` in the raw archive and `00-shared/handover/` in the Virtual Office archive. Both get `HANDOVER_STATUS.md`. If the directory is missing or has no files, that status says `not supplied` and `not a complete handover`, and `coverage.md` repeats the gap. An empty handover is not described as complete.
+
+## Local synthetic verification
+
+The regression tests use temporary trees and synthetic strings only. They do not read a live account or a private backup.
+
+```bash
+python3 -m compileall -q grok_bot_backup tests
+bash -n bin/*.sh
+python3 -m unittest discover -s tests -v
+python3 -m unittest tests.test_credential_filter tests.test_content_sanitize -v
+```
 
 ## Prepare platform memory *before* backup
 
@@ -238,6 +275,7 @@ Inspect the raw export's `meta/MANIFEST.json`, `meta/workspace-copy.json`, and `
 | `INCLUDE_CREDENTIAL_FILES` | `0` | Set `1` to copy env files, private keys, cookie/session/token files, and credential directories. Unsafe |
 | `INCLUDE_AUTH_DATABASES` | `0` | Set `1` to copy authentication databases matched by filename. They are not inspected |
 | `INCLUDE_OPAQUE_ARCHIVES` | `0` | Set `1` to copy nested zip/tar/7z/rar archives. Contents are not filtered |
+| `SANITIZE_MAX_BYTES` | `1048576` | Largest file that is scanned. Larger files are omitted |
 | `MEMORY_DROP` | `$WORKSPACE/exports/memory-drop` | Pre-exported platform memory files |
 | `MEMORY_MAX_AGE_DAYS` | `2` | Max age of a memory drop before WARN / strict FAIL |
 | `GROK_BACKUP_CONFIG` | `<repo>/config.json` | Optional expected agent roster |
@@ -325,8 +363,8 @@ Backup data is **unencrypted** and may include credentials, confidential convers
 - Full system prompts are platform-hosted. `instructions.md` is always `source: reconstructed`: the profile description, the first handoff copied verbatim, and standing rules when a standing-rules file or field exists. The instructions cell is `unavailable`.
 - Routines come first from each memory drop's `routines.json`. Each item keeps `source` of `platform`, `box-cron`, `memory-drop`, or `inferred`. The raw file is copied to `routines/routines.json` and summarized in `routines.md`. Disk `crontab.txt`, `cron.json`, and schedule directories fill gaps. Inferred rows are guesses. If every source misses, `routines.md` says unavailable and the export prints **WARN**.
 - `memory-export-notes.json` is not a memory declaration. Delete a stale `memory-status.json` when facts exist; do not rename it.
-- Agent local SQLite copies may be live files. The conversation index is snapshot consistently, but **not every raw database is guaranteed to be a consistent snapshot**.
-- Filename exclusions do not read file contents. Secrets in ordinary prose, settings values, memory facts, and conversations can remain in the archive. Opaque archives and authentication databases are identified by name; opting in copies them whole without inspection. `missing=0` is not full platform availability.
+- Generic SQLite files, including `store.db` and the raw search-index snapshot, are omitted from the archive because they cannot be scanned safely. Tool-call rows can still be extracted into text and then redacted. A database copied while applications are running is not a consistent snapshot even when it is read for that text.
+- High-confidence scans redact exact secret keys and assignment patterns. Ordinary prose can still contain a secret. Opting in to opaque archives copies them whole without inspection. `missing=0` is not full platform availability, and a finished scan is not a secret-free claim.
 - Local memory can be stale. The memory-drop process requires agent cooperation; exported-fact completeness is not technically guaranteed. `MEMORY_MAX_AGE_DAYS` defaults to 2. `--strict` still fails when a memory drop is missing, stale, empty without a real declaration, or contradictory.
 - Different Grok Bot versions may use different internal storage layouts. Paths must be checked on the target box.
 - This is an **export**, not an automatic restore workflow. Recovery/rehydration into a new provider must be planned separately.
@@ -350,7 +388,7 @@ No third-party packages are required. Python 3.12 or newer is the version used i
 To inspect one synthetic run yourself, the same layout the test builds is enough: point `AGENT_DATA`, `WORKSPACE`, `OUT_ROOT`, and `MEMORY_DROP` at temporary directories you created, run `bin/export-grok-bot-backup.sh` and `bin/export-virtual-office.sh`, then search the ZIP for a marker that you put only in an excluded file. Do not point those variables at a real home directory or a real backup for this check. Checking a private computer's real export is a separate later step; do not upload that archive or paste secret file contents into an issue.
 
 ```bash
-python3 -m unittest tests.test_credential_filter -v
+python3 -m unittest tests.test_credential_filter tests.test_content_sanitize -v
 python3 -m unittest discover -s tests -v
 ```
 

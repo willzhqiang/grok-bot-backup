@@ -74,7 +74,8 @@ def write(path: pathlib.Path, text: str) -> None:
 
 
 def copy_if(src: pathlib.Path, dst: pathlib.Path) -> None:
-    """Copy a regular file. Symlinks are not followed. Excluded names are skipped."""
+    """Copy a regular file. Symlinks are not followed. Excluded or unscannable files are skipped."""
+    from .sanitize import transfer_regular_file
     from .sensitive import exclusion_reason
 
     src = pathlib.Path(src)
@@ -83,8 +84,7 @@ def copy_if(src: pathlib.Path, dst: pathlib.Path) -> None:
     names = tuple(part for part in src.parts if part not in (os.sep, "/", ""))
     if names and exclusion_reason(names, is_dir=False):
         return
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(src, dst)
+    transfer_regular_file(src, dst)
 
 
 def lock_down(root: pathlib.Path) -> None:

@@ -340,7 +340,13 @@ def probe_instructions(agent_dir: pathlib.Path, profile: dict, handoff: str | No
         ("standing-rules.md", "rules.md"),
         ("standingRules", "standing_rules"),
     )
+    from .sanitize import redact_text
     description = profile.get("description") if isinstance(profile.get("description"), str) else ""
+    description, _count = redact_text(description)
+    if isinstance(rules, str):
+        rules, _count = redact_text(rules)
+    if isinstance(handoff_text, str):
+        handoff_text, _count = redact_text(handoff_text)
     body = "\n".join([
         "## Description",
         "",
@@ -415,6 +421,11 @@ def _is_cron_fields(fields: list[str]) -> bool:
 
 
 def _routine(name, cron, timezone, prompt, enabled, last_run, source, origin, note="") -> dict:
+    from .sanitize import redact_text
+    if isinstance(prompt, str):
+        prompt, _count = redact_text(prompt)
+    if isinstance(name, str):
+        name, _count = redact_text(name)
     item = {
         "name": name,
         "cron": cron,

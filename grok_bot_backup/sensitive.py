@@ -8,19 +8,10 @@ returns file contents and never logs them.
 from __future__ import annotations
 
 import os
-import re
 from pathlib import Path, PurePosixPath
 import shutil
 import stat
 from dataclasses import dataclass
-
-
-# Exact key names only. "max_tokens" and "sessionTimeout" are ordinary settings.
-_EXACT_SECRET_KEY = re.compile(
-    r"^(?:api[_-]?key|access[_-]?token|refresh[_-]?token|secret|secrets|password|passwd|"
-    r"token|tokens|authorization|credential|credentials|private[_-]?key|client[_-]?secret)$",
-    re.IGNORECASE,
-)
 
 
 AVAILABILITY_NOTE = (
@@ -29,14 +20,17 @@ AVAILABILITY_NOTE = (
 )
 
 LIMITATIONS = (
-    "Filename and directory rules do not read file contents. Secrets written inside ordinary "
-    "notes, settings values, memory facts, conversations, or source code are not detected.",
+    "Text and JSON are scanned for high-confidence credential assignments and exact secret keys. "
+    "This is not a secret-free guarantee. Ordinary prose can still contain a secret that does not "
+    "match those patterns. Removed values are not written to logs or reports.",
+    "max_tokens and technical discussion of tokens are kept. A JSON key that is exactly token, "
+    "api_key, access_token, authorization, password, or private_key is redacted.",
+    "Binary databases, opaque attachments, oversize files, and unrecognized encodings are omitted "
+    "instead of copied. They are not inspected. store.db and the raw search-index snapshot are "
+    "in this group. INCLUDE_AUTH_DATABASES=1 does not put those generic databases back.",
     "Opaque nested archives are not opened. INCLUDE_OPAQUE_ARCHIVES=1 copies them whole and "
     "does not filter files inside them. Previous grok-bot-export and virtual-office archives "
     "stay excluded either way.",
-    "Authentication databases are recognized by filename, not by schema. store.db and "
-    "search-index.db are kept and are not scanned. INCLUDE_AUTH_DATABASES=1 copies the "
-    "recognized database files without inspecting them.",
     "Symlinks that leave the source tree or point at an excluded path are omitted and are never "
     "followed. In-tree links to ordinary files are stored as links.",
     "INCLUDE_CREDENTIAL_FILES=1 copies env files, private keys, cookie and session files, "
@@ -370,17 +364,10 @@ def redact_exact_secret_keys(value):
 
     The original value is not returned and is not included in errors.
     """
-    if isinstance(value, dict):
-        redacted = {}
-        for key, item in value.items():
-            if isinstance(key, str) and _EXACT_SECRET_KEY.fullmatch(key):
-                redacted[key] = "<redacted>"
-            else:
-                redacted[key] = redact_exact_secret_keys(item)
-        return redacted
-    if isinstance(value, list):
-        return [redact_exact_secret_keys(item) for item in value]
-    return value
+    from .sanitize import redact_structured
+
+    redacted, _stats = redact_structured(value)
+    return redacted
 
 
 def read_regular_text(path: Path, limit: int = 1_000_000) -> str | None:
@@ -484,7 +471,10 @@ def copy_tree(
         dst_resolved = dst
     excluded: list[dict] = []
     skipped: list[str] = []
+    redacted: list[dict] = []
+    omitted_unscannable: list[dict] = []
     copied = 0
+    inspected = 0
 
     def record(rel: str, reason: str) -> None:
         excluded.append({"path": rel, "reason": reason})
@@ -514,7 +504,7 @@ def copy_tree(
         return exclusion_reason(tuple(PurePosixPath(rel).parts), is_dir=is_dir, policy=policy)
 
     def walk(directory: Path) -> None:
-        nonlocal copied
+        nonlocal copied, inspected
         for entry in sorted(directory.iterdir(), key=lambda item: item.name):
             rel = entry.relative_to(src_root).as_posix()
             reason = reason_for(entry, rel)
@@ -534,19 +524,38 @@ def copy_tree(
                 walk(entry)
                 continue
             if _is_regular_nofollow(entry):
-                _copy_nofollow(entry, target)
+                from .sanitize import transfer_regular_file
+
+                outcome = transfer_regular_file(entry, target)
+                if outcome["action"] == "omitted":
+                    reason = outcome.get("reason") or "unscannable"
+                    record(rel, reason)
+                    omitted_unscannable.append({"path": rel, "reason": reason})
+                    continue
+                inspected += 1
                 copied += 1
+                if outcome["action"] == "redacted" or outcome["structured_keys"] or outcome["text_redactions"]:
+                    redacted.append({
+                        "path": rel,
+                        "structured_keys": outcome["structured_keys"],
+                        "text_redactions": outcome["text_redactions"],
+                    })
                 continue
             record(rel, "unsupported file type")
 
     walk(src_root)
     excluded.sort(key=lambda item: item["path"])
+    redacted.sort(key=lambda item: item["path"])
+    omitted_unscannable.sort(key=lambda item: item["path"])
     return {
         "label": label or str(src_root),
         "source": str(src_root),
         "destination": str(dst),
         "copied_files": copied,
+        "inspected_files": inspected,
         "excluded": excluded,
+        "redacted": redacted,
+        "omitted_unscannable": omitted_unscannable,
         "skipped": sorted(set(skipped)),
         "policy": policy.as_dict(),
         "limitations": list(LIMITATIONS),
@@ -598,7 +607,12 @@ def classify_tree(root: Path, policy: Policy | None = None) -> tuple[int, int]:
                 else:
                     eligible += 1
                 continue
-            if exclusion_reason(parts, is_dir=False, policy=policy) or not _is_regular_nofollow(entry):
+            from .sanitize import unscannable_reason
+            if (
+                exclusion_reason(parts, is_dir=False, policy=policy)
+                or not _is_regular_nofollow(entry)
+                or unscannable_reason(entry)
+            ):
                 blocked += 1
             else:
                 eligible += 1
@@ -676,21 +690,51 @@ def scrub_tree(root: Path, policy: Policy | None = None) -> list[dict]:
 def combine_reports(reports: list[dict], policy: Policy | None = None) -> dict:
     policy = policy or load_policy()
     excluded = []
+    redacted = []
+    omitted = []
+    inspected = 0
     for report in reports:
         label = report.get("label") or report.get("source") or ""
+        inspected += int(report.get("inspected_files") or 0)
         for item in report.get("excluded") or []:
             path = item.get("path")
             reason = item.get("reason")
             if not isinstance(path, str) or not isinstance(reason, str):
                 continue
             excluded.append({"source": label, "path": path, "reason": reason})
+        for item in report.get("redacted") or []:
+            path = item.get("path")
+            if not isinstance(path, str):
+                continue
+            redacted.append({
+                "source": label,
+                "path": path,
+                "structured_keys": list(item.get("structured_keys") or []),
+                "text_redactions": int(item.get("text_redactions") or 0),
+            })
+        for item in report.get("omitted_unscannable") or []:
+            path = item.get("path")
+            reason = item.get("reason")
+            if isinstance(path, str) and isinstance(reason, str):
+                omitted.append({"source": label, "path": path, "reason": reason})
     excluded.sort(key=lambda item: (item["source"], item["path"]))
+    redacted.sort(key=lambda item: (item["source"], item["path"]))
+    omitted.sort(key=lambda item: (item["source"], item["path"]))
     return {
         "excluded_count": len(excluded),
         "excluded": excluded,
+        "inspected_files": inspected,
+        "redacted_count": len(redacted),
+        "redacted": redacted,
+        "omitted_unscannable_count": len(omitted),
+        "omitted_unscannable": omitted,
         "policy": policy.as_dict(),
         "limitations": list(LIMITATIONS),
         "coverage_note": AVAILABILITY_NOTE,
+        "scan_note": (
+            "inspected_files were decoded and scanned. redacted lists paths and key names only. "
+            "omitted_unscannable files were not copied. This is not a secret-free claim."
+        ),
     }
 
 

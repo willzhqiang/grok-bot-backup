@@ -154,6 +154,13 @@ python3 -m grok_bot_backup.coverage \
   --stats "$DEST/conversations/conversation-stats.json" \
   --out "$DEST"
 
+# Handover self-report from AGENT_DATA/handover, or an explicit not-supplied marker.
+python3 -m grok_bot_backup.handover \
+  --dest "$DEST/handover" \
+  --label raw-handover \
+  --report "$DEST/meta/handover-copy.json" \
+  --coverage "$DEST/coverage.md"
+
 # --- Copy of this backup program: repo source at HEAD + commit hash ---
 python3 -m grok_bot_backup.program "$DEST/meta/backup-program" > "$DEST/meta/.program.out"
 PROGRAM_COMMIT="$(sed -n 's/^PROGRAM_COMMIT=//p' "$DEST/meta/.program.out")"
